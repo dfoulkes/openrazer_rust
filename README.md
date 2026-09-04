@@ -116,14 +116,20 @@ guessed. To add yours:
    the nodes are `root:root` mode `0600`.
 
    ```sh
-   sudo cp udev/99-razer-rust.rules /etc/udev/rules.d/
+   sudo cp udev/60-razer-rust.rules /etc/udev/rules.d/
    sudo udevadm control --reload-rules && sudo udevadm trigger
    ```
 
-   It uses `TAG+="uaccess"` by default, which hands access to whoever is logged in at the
-   local seat via systemd-logind ACLs — no group needs to exist and no user needs adding
-   to one. A group-based fallback for headless, multi-seat or non-systemd setups is
-   commented in the file.
+   It uses `TAG+="uaccess"`, which hands access to whoever is logged in at the local seat
+   via ACLs — no group needs to exist and no user needs adding to one. A group-based
+   fallback for headless, multi-seat or non-systemd setups is commented in the file.
+
+   **The `60-` prefix is load-bearing.** systemd's `73-seat-late.rules` is what actually
+   applies the ACL (`TAG=="uaccess" ... RUN{builtin}+="uaccess"`), so a rule that sets the
+   tag at `99-` sets it twenty-six rules too late. The symptom is deeply misleading: the
+   tag *is* present in `udevadm info` (`CURRENT_TAGS=:uaccess:seat:`) and the ACL is simply
+   never written, so it looks like the rule never matched. Verify with `getfacl` and look
+   for a **named** entry — `user:you:rw-`. A bare `user::rw-` is the owner (root), not you.
 
    The rule sets permissions only. It has no `RUN+=`, binds and unbinds nothing, and
    cannot affect whether your keyboard types.

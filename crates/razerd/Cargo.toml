@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+razer-proto = { path = "../razer-proto" }
+razer-devices = { path = "../razer-devices" }
+razer-hid = { path = "../razer-hid" }
 
 [[bin]]
 name = "razerd"

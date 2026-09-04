@@ -9,8 +9,24 @@
 # are root:root mode 0600 and razerd cannot open them as a normal user.
 #
 # Install:
-#   sudo cp udev/99-razer-rust.rules /etc/udev/rules.d/
-#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   sudo cp udev/60-razer-rust.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --action=add --subsystem-match=hidraw
+#
+# THE FILENAME NUMBER MATTERS. It must sort BEFORE systemd's
+# /usr/lib/udev/rules.d/73-seat-late.rules, which contains:
+#
+#     TAG=="uaccess|xaccess-*", ENV{MAJOR}!="", RUN{builtin}+="uaccess"
+#
+# That is the line that actually applies the ACL. A rule numbered 99 sets the
+# tag long after rule 73 has looked for it: the tag shows up in `udevadm info`
+# (CURRENT_TAGS=:uaccess:seat:) and the ACL is never written, which looks for
+# all the world like the rule "didn't apply". It did — it was just too late.
+# Hence 60, matching the convention used by Steam (60-) and KDE Connect (40-).
+#
+# Verify with `getfacl /dev/hidrawN` and look for a NAMED entry:
+#     user:yourname:rw-      <- correct
+#     user::rw-              <- this is the OWNER (root), not you
 #
 # NOTE ON SAFETY: this rule only sets permissions. It contains no RUN+=, does
 # not bind or unbind drivers, and cannot affect whether your keyboard types.

@@ -28,3 +28,8 @@ version = "0.1.0"
 [[package]]
 name = "razerd"
 version = "0.1.0"
+dependencies = [
+ "razer-devices",
+ "razer-hid",
+ "razer-proto",
+]
