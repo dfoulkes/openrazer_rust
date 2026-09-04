@@ -24,6 +24,49 @@ fn check_data_size(report: &RazerReport) -> Result<(), ProtoError> {
     Ok(())
 }
 
+/// Reject a report that must not be put on the wire.
+///
+/// The mirror image of [`check_response`], and the reason it exists is that
+/// every other guard in this workspace fires before anything is sent —
+/// `razer_hid::Session`'s capability check most obviously — while the one guard
+/// that knows a report is malformed used to fire only on the way *back*, after
+/// the `HIDIOCSFEATURE` had already gone out. On hardware where a single
+/// malformed frame is the suspected cause of a firmware reset, that is the wrong
+/// side of the transaction.
+///
+/// Checks the three fields that have exactly one legal value for every command
+/// this crate constructs:
+///
+/// - `data_size` must fit the argument array (`razercommon.c:93-99` returns
+///   `-EINVAL` for this),
+/// - `protocol_type` is always `0x00` (`razercommon.h:128`),
+/// - `reserved` is always `0x00` (`razercommon.h:134`).
+///
+/// `remaining_packets` is deliberately **not** checked. It is 0 for every
+/// command in scope, but it is a real multi-packet sequencing field, so
+/// rejecting a non-zero value here would be inventing a protocol constraint
+/// rather than enforcing one.
+///
+/// # Errors
+///
+/// - [`ProtoError::DataSizeTooLarge`] if `data_size` exceeds
+///   [`ARGS_LEN`](crate::ARGS_LEN).
+/// - [`ProtoError::Malformed`] if `protocol_type` or `reserved` is non-zero.
+pub fn check_request(request: &RazerReport) -> Result<(), ProtoError> {
+    check_data_size(request)?;
+    if request.protocol_type != 0x00 {
+        return Err(ProtoError::Malformed(
+            "protocol_type must be 0x00 on an outbound report",
+        ));
+    }
+    if request.reserved != 0x00 {
+        return Err(ProtoError::Malformed(
+            "reserved must be 0x00 on an outbound report",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a response against the request that produced it.
 ///
 /// Mirrors `razer_send_payload()` (`razerkbd_driver.c:436-449`):
@@ -173,7 +216,7 @@ pub fn poll_rate_v2(response: &RazerReport) -> Result<PollRate, ProtoError> {
 mod tests {
     use super::*;
     use crate::cmd;
-    use crate::report::{DeviceMode, LedId, Status, Storage};
+    use crate::report::{DeviceMode, LedId, PollRate, Status, Storage};
 
     /// Build a plausible response to `request`: same routing fields, given
     /// status, given payload.
@@ -251,6 +294,73 @@ mod tests {
                 Err(ProtoError::DeviceStatus(status))
             );
         }
+    }
+
+    #[test]
+    fn check_request_passes_every_constructor_in_the_crate() {
+        for r in [
+            cmd::set_device_mode(DeviceMode::Driver),
+            cmd::set_device_mode(DeviceMode::Normal),
+            cmd::get_device_mode(),
+            cmd::get_firmware_version(),
+            cmd::get_serial(),
+            cmd::set_brightness(Storage::VarStore, LedId::Backlight, 0x80),
+            cmd::get_brightness(Storage::VarStore, LedId::Backlight),
+            cmd::set_static_effect(Storage::VarStore, LedId::Zero, crate::Rgb::new(1, 2, 3)),
+            cmd::set_effect_none(Storage::VarStore, LedId::Backlight),
+            cmd::set_poll_rate_legacy(PollRate::Hz1000).expect("legacy-encodable"),
+            cmd::get_poll_rate_legacy(),
+            cmd::set_poll_rate_v2(PollRate::Hz1000, 0x00),
+            cmd::get_poll_rate_v2(),
+        ] {
+            assert_eq!(
+                check_request(&r),
+                Ok(()),
+                "class {:#04x} id {:#04x} was rejected by its own outbound guard",
+                r.command_class,
+                r.command_id
+            );
+        }
+    }
+
+    #[test]
+    fn check_request_rejects_what_must_never_be_sent() {
+        let base = cmd::set_device_mode(DeviceMode::Driver);
+
+        let mut fat = base;
+        fat.data_size = 81;
+        assert_eq!(
+            check_request(&fat),
+            Err(ProtoError::DataSizeTooLarge { got: 81 })
+        );
+
+        let mut at_limit = base;
+        at_limit.data_size = 80;
+        assert_eq!(
+            check_request(&at_limit),
+            Ok(()),
+            "80 is the limit, not past it"
+        );
+
+        let mut proto = base;
+        proto.protocol_type = 0x42;
+        assert!(matches!(
+            check_request(&proto),
+            Err(ProtoError::Malformed(_))
+        ));
+
+        let mut rsvd = base;
+        rsvd.reserved = 0x99;
+        assert!(matches!(
+            check_request(&rsvd),
+            Err(ProtoError::Malformed(_))
+        ));
+
+        // Not our business to police: remaining_packets is a real sequencing
+        // field, 0 for everything in scope but not invalid in general.
+        let mut multi = base;
+        multi.remaining_packets = 0xBEEF;
+        assert_eq!(check_request(&multi), Ok(()));
     }
 
     /// Acceptance criterion 35.

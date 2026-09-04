@@ -102,19 +102,30 @@ def send_recv(node, command_class, command_id, data_size):
 STATUS = {0x00: 'NEW', 0x01: 'BUSY', 0x02: 'SUCCESSFUL', 0x03: 'FAILURE',
           0x04: 'TIMEOUT', 0x05: 'NOT_SUPPORTED'}
 
+# RAZER_CMD_SUCCESSFUL, and RAZER_CMD_BUSY which the C driver treats as success:
+# razer_send_payload(), razerkbd_driver.c:447-449 "Some commands respond with
+# 'busy' but succeed." Matches razer_proto::Status::is_ok.
+OK_STATUSES = (0x02, 0x01)
+
+# Verdicts. "no ground truth" is a distinct outcome from "mismatch": the README
+# says you do not need OpenRazer installed, so a machine without razerkbd loaded
+# must not be told its perfectly good transport is unproven.
+PROVEN, UNPROVEN, NO_TRUTH = 'proven', 'unproven', 'no-truth'
+
+
 def rung1(node):
     ok = True
     resp = send_recv(node, 0x00, 0x81, 0x02)          # firmware version
     st = resp[0]
     fw = 'v%d.%d' % (resp[8], resp[9])
     print('  RUNG 1  firmware      status=0x%02x %-12s -> %s' % (st, STATUS.get(st, '?'), fw))
-    ok &= (st == 0x02)
+    ok &= (st in OK_STATUSES)
 
     resp = send_recv(node, 0x00, 0x82, 0x16)          # serial
     st = resp[0]
     serial = resp[8:8 + 22].split(b'\x00')[0].decode('ascii', 'replace')
     print('  RUNG 1  serial        status=0x%02x %-12s -> %s' % (st, STATUS.get(st, '?'), serial))
-    ok &= (st == 0x02)
+    ok &= (st in OK_STATUSES)
 
     print()
     truth_fw = truth_sn = None
@@ -126,10 +137,18 @@ def rung1(node):
             break
         except Exception:
             continue
+
+    if truth_fw is None or truth_sn is None:
+        print('  CROSS-CHECK vs razerkbd sysfs: SKIPPED')
+        print('    razerkbd is not loaded (or exposes no sysfs for this device), so there')
+        print('    is nothing to compare against. That is a normal setup — this project')
+        print('    does not require OpenRazer — it just means the cross-check cannot run.')
+        return NO_TRUTH if ok else UNPROVEN
+
     print('  CROSS-CHECK vs razerkbd sysfs:')
     print('    firmware  ours=%-8s razerkbd=%-8s  %s' % (fw, truth_fw, 'MATCH' if fw == truth_fw else 'MISMATCH'))
     print('    serial    ours=%-18s razerkbd=%-18s  %s' % (serial, truth_sn, 'MATCH' if serial == truth_sn else 'MISMATCH'))
-    return ok and fw == truth_fw and serial == truth_sn
+    return PROVEN if (ok and fw == truth_fw and serial == truth_sn) else UNPROVEN
 
 if __name__ == '__main__':
     node, iface = find_node(3)
@@ -142,8 +161,18 @@ if __name__ == '__main__':
         print('  PERMISSION DENIED — run with sudo'); sys.exit(1)
     if '--rung1' in sys.argv:
         print()
-        good = rung1(node)
-        print('\nVERDICT: %s' % ('hidraw transport PROVEN, encoding+CRC independently validated'
-                                 if good else 'NOT proven — see above, do not proceed to Phase 3'))
+        verdict = rung1(node)
+        if verdict == PROVEN:
+            print('\nVERDICT: hidraw transport PROVEN, encoding+CRC independently validated')
+        elif verdict == NO_TRUTH:
+            print('\nVERDICT: transport WORKS — the device answered both reads with a success')
+            print('         status and plausible values, so the wire format is right. Not')
+            print('         independently cross-checked, because razerkbd is not loaded.')
+            print('         Load it (or check the values against the label on the device)')
+            print('         before treating this as confirmation.')
+            sys.exit(0)
+        else:
+            print('\nVERDICT: NOT proven — see above, do not proceed to Phase 3')
+            sys.exit(1)
     else:
         print('\n  (rung 1 not run — pass --rung1 to send the benign read commands)')

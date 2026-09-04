@@ -17,10 +17,10 @@ mod metrics;
 use std::process::ExitCode;
 
 use razer_devices::{DeviceEntry, lookup};
-use razer_proto::report::DeviceMode;
 use razer_hid::{
     HardwareOptIn, HidrawDevice, RealClock, RealSysfs, Session, find_device, list_razer_nodes,
 };
+use razer_proto::report::DeviceMode;
 
 const RAZER_VID: u16 = 0x1532;
 
@@ -94,12 +94,12 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     println!(
-        "{:<10} {:<16} {:>6} {:>6}  {}",
-        "NODE", "PATH", "PID", "IFACE", "SUPPORTED"
+        "{:<10} {:<16} {:>6} {:>6}  SUPPORTED",
+        "NODE", "PATH", "PID", "IFACE"
     );
     for n in &nodes {
-        let supported = lookup(n.info.product_id)
-            .map_or_else(|| "-".to_string(), |e| e.name.to_string());
+        let supported =
+            lookup(n.info.product_id).map_or_else(|| "-".to_string(), |e| e.name.to_string());
         println!(
             "{:<10} {:<16} 0x{:04X} {:>6}  {}",
             n.name,
@@ -112,22 +112,42 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Absolute paths to try for `journalctl`, in order.
+///
+/// Absolute, never a bare name: this binary's own usage text tells people to
+/// reach for `sudo` when they hit a permission error, and a `$PATH` lookup in a
+/// process running as root is a lookup an attacker gets a say in. On any
+/// systemd machine the first entry is the one that exists.
+const JOURNALCTL: [&str; 2] = ["/usr/bin/journalctl", "/bin/journalctl"];
+
 /// Count `USB disconnect` lines in the current boot's kernel log.
 ///
 /// Crude, but it is the same evidence the whole investigation rests on, and
 /// having the tool report it removes a manual step from the experiment.
 fn disconnect_count() -> Option<u64> {
-    let out = std::process::Command::new("journalctl")
-        .args(["-k", "-b", "--no-pager"])
-        .output()
-        .ok()?;
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| l.contains("USB disconnect"))
-            .count() as u64,
-    )
+    for exe in JOURNALCTL {
+        let Ok(out) = std::process::Command::new(exe)
+            .args(["-k", "-b", "--no-pager"])
+            .output()
+        else {
+            continue;
+        };
+        return Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.contains("USB disconnect"))
+                .count() as u64,
+        );
+    }
+    None
 }
+
+/// How long to watch for a firmware reset after a device-mode write.
+///
+/// The observed delay between a bad write and the `USB disconnect` has ranged
+/// from 4 s to 73 s (`docs/phase3-experiment.md`), so anything shorter than the
+/// top of that range reports "no reset" for cases it simply did not wait for.
+const WATCH_SECONDS: u32 = 90;
 
 /// Set the operating mode on the keyboard. THIS WRITES TO THE DEVICE.
 ///
@@ -147,15 +167,33 @@ fn set_device_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    let tid_override = args
-        .iter()
-        .position(|a| a == "--transaction-id")
-        .and_then(|i| args.get(i + 1))
-        .map(|v| {
-            let v = v.trim_start_matches("0x").trim_start_matches("0X");
-            u8::from_str_radix(v, 16)
-        })
-        .transpose()?;
+    let tid_override = match args.iter().position(|a| a == "--transaction-id") {
+        None => None,
+        Some(i) => {
+            let raw = args
+                .get(i + 1)
+                .ok_or("--transaction-id needs a value, e.g. --transaction-id 1F")?;
+            // A flag here means the value was forgotten and the next argument
+            // got eaten. Saying so beats "invalid digit found in string" —
+            // especially when the argument eaten is --yes-i-am-at-the-desk.
+            if raw.starts_with('-') {
+                return Err(format!(
+                    "--transaction-id needs a hex value, but got the flag `{raw}`"
+                )
+                .into());
+            }
+            // strip_prefix once, not trim_start_matches: the latter strips
+            // repeats, so `0x0x0xFF` would parse happily as 0xFF.
+            let digits = raw
+                .strip_prefix("0x")
+                .or_else(|| raw.strip_prefix("0X"))
+                .unwrap_or(raw);
+            if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!("`{raw}` is not a hex byte, e.g. 1F or 0x1F").into());
+            }
+            Some(u8::from_str_radix(digits, 16)?)
+        }
+    };
 
     let opt_in = HardwareOptIn::i_understand_this_touches_real_hardware();
     let sysfs = RealSysfs::new(&opt_in);
@@ -172,11 +210,14 @@ fn set_device_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("{} ({:#06X})", entry.name, entry.pid);
     println!("  node             {}", node.path.display());
     println!("  mode             {mode:?} (0x{:02X})", mode.to_u8());
-    println!("  transaction id   0x{tid:02X}{}", if tid_override.is_some() {
-        "   <-- OVERRIDDEN"
-    } else {
-        "   (from device table)"
-    });
+    println!(
+        "  transaction id   0x{tid:02X}{}",
+        if tid_override.is_some() {
+            "   <-- OVERRIDDEN"
+        } else {
+            "   (from device table)"
+        }
+    );
     if tid == 0xFF {
         println!("  *** 0xFF is the value the upstream C driver sends and the value");
         println!("  *** this project exists to avoid. Expect a firmware reset.");
@@ -188,7 +229,10 @@ fn set_device_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("  disconnects before: {b}");
     }
 
-    let mut transport = HidrawDevice::open(&node.path, &opt_in)?;
+    // open_expecting, not open: this path writes to the device, and a
+    // re-enumeration between find_device and here can leave a different device
+    // on the same /dev/hidrawN. Re-enumeration is the exact fault under study.
+    let mut transport = HidrawDevice::open_expecting(&node.path, RAZER_VID, pid, &opt_in)?;
     let mut clock = RealClock;
     let mut session = Session::new(entry, &mut transport, &mut clock);
     if let Some(t) = tid_override {
@@ -199,28 +243,36 @@ fn set_device_mode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let result = session.set_device_mode(mode);
     let elapsed = started.elapsed();
     println!("  attempts         {}", session.last_attempts());
-    println!("  elapsed          {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "  elapsed          {:.3} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    if let Some(echoed) = session.last_response_transaction_id() {
+        let note = if echoed == tid { "" } else { "   <-- DIFFERS" };
+        println!("  echoed txn id    0x{echoed:02X}{note}");
+    }
     match result {
         Ok(()) => println!("  result           OK"),
         Err(e) => println!("  result           ERROR: {e}"),
     }
 
-    // Give the firmware time to misbehave if it is going to. The observed
-    // delay between a bad write and the disconnect has been 4-73 seconds, so
-    // this is a first look, not a clean bill of health.
-    println!("\n  watching for 20 s ...");
-    for i in 1..=20 {
+    // Give the firmware time to misbehave if it is going to. The observed delay
+    // between a bad write and the disconnect spans 4-73 s, so the window has to
+    // clear the top of that range or a negative result means nothing.
+    println!("\n  watching for {WATCH_SECONDS} s ...");
+    for i in 1..=WATCH_SECONDS {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        if let (Some(b), Some(a)) = (before, disconnect_count()) {
-            if a > b {
-                println!("  *** USB DISCONNECT after {i} s (count {b} -> {a})");
-                println!("  *** replug the keyboard. This transaction id is NOT safe.");
-                return Ok(());
-            }
+        if let (Some(b), Some(a)) = (before, disconnect_count())
+            && a > b
+        {
+            println!("  *** USB DISCONNECT after {i} s (count {b} -> {a})");
+            println!("  *** replug the keyboard. This transaction id is NOT safe.");
+            return Ok(());
         }
     }
     if let (Some(b), Some(a)) = (before, disconnect_count()) {
-        println!("  disconnects after:  {a} (was {b}) — no reset in 20 s");
+        println!("  disconnects after:  {a} (was {b}) — no reset within {WATCH_SECONDS} s");
+        println!("  (the observed range is 4-73 s, so this window clears it — but see below)");
     }
     println!("\n  NOTE: one trial is not the experiment. See docs/phase3-experiment.md.");
     Ok(())
@@ -255,14 +307,28 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
 
     for pid in pids {
         let entry: &'static DeviceEntry = lookup(pid).expect("checked above");
-        let node = find_device(&sysfs, RAZER_VID, pid, entry.report_index)?;
 
         println!("\n{} (0x{:04X})", entry.name, entry.pid);
+
+        // A device that vanished between the listing above and this lookup is
+        // one device's problem, not the run's. Handled the same way as a failed
+        // open two lines down, rather than abandoning every remaining device.
+        let node = match find_device(&sysfs, RAZER_VID, pid, entry.report_index) {
+            Ok(n) => n,
+            Err(e) => {
+                println!("  ERROR locating the control interface: {e}");
+                println!("  (unplugged mid-run? try again)");
+                failed += 1;
+                continue;
+            }
+        };
+
         println!("  node            {}", node.path.display());
         println!("  usb interface   {}", node.info.interface_number);
         println!("  transaction id  0x{:02X}", entry.transaction_id);
 
-        let mut transport = match HidrawDevice::open(&node.path, &opt_in) {
+        let mut transport = match HidrawDevice::open_expecting(&node.path, RAZER_VID, pid, &opt_in)
+        {
             Ok(t) => t,
             Err(e) => {
                 println!("  ERROR opening {}: {e}", node.path.display());

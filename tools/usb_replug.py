@@ -30,10 +30,16 @@ Writing 1 to <hub>:1.0/<hub>-portN/disable takes the port down as far as the hub
 is concerned. Writing 0 brings it back and the device re-enumerates from scratch,
 renegotiating speed — which is what a physical replug achieves.
 
-THE PORT IS ALWAYS RE-ENABLED, including on exception or Ctrl+C. Leaving a
-keyboard's port disabled would be a genuinely nasty way to lose a machine.
+THE PORT IS ALWAYS RE-ENABLED: on the happy path, on any exception, at
+interpreter exit, and on SIGINT, SIGTERM or SIGHUP. Leaving a keyboard's port
+disabled would be a genuinely nasty way to lose a machine.
+
+SIGHUP is not paranoia. The whole point of this tool is doing a replug "without
+reaching behind the desk" — i.e. over SSH — and a dropped SSH session delivers
+exactly that signal. Handling only SIGINT would mean a flaky connection could
+leave the port down until someone physically replugs it or reboots.
 """
-import glob, os, signal, sys, time
+import atexit, glob, os, signal, sys, time
 
 VID, PID = '1532', '028d'
 
@@ -83,22 +89,47 @@ def main():
         print("  already at high speed — nothing to prove. Aborting.")
         return 0
 
+    # Idempotent, because several paths can reach it: the `finally` below, the
+    # atexit hook, and a signal handler that fires during either. Writing '0' to
+    # an already-enabled port is harmless, but saying so twice is confusing.
+    state = {'disabled': False}
+
     def reenable(*_):
+        if not state['disabled']:
+            return
         try:
             with open(path, 'w') as f:
                 f.write('0')
+            state['disabled'] = False
             print("  port re-enabled")
         except Exception as e:
             print(f"  !!! FAILED TO RE-ENABLE PORT: {e}")
             print(f"  !!! run: echo 0 | sudo tee {path}")
             print("  !!! or replug the keyboard by hand")
 
-    # Re-enable on Ctrl+C too, not just on the happy path.
-    signal.signal(signal.SIGINT, lambda *a: (reenable(), sys.exit(130)))
+    def bail(signum, _frame):
+        reenable()
+        sys.exit(128 + signum)
+
+    # Every way this process can be told to stop. SIGHUP is the one that matters
+    # for the over-SSH use case; SIGTERM covers `kill` and systemd. Without
+    # these, the default action terminates the process mid-sleep with the
+    # keyboard's port still down.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, bail)
+    # And a last-resort net for any exit path the above miss (including
+    # SystemExit raised from inside a handler).
+    atexit.register(reenable)
 
     try:
         print("  disabling port (keyboard will disappear) ...")
         with open(path, 'w') as f:
+            # Set before the write, not after: once the fd is open, assume the
+            # port may be down and always re-enable. (If the *open* failed we
+            # never got here, so the flag stays False and reenable() correctly
+            # stays quiet instead of printing a scary failure for a port that
+            # was never disabled.)
+            state['disabled'] = True
             f.write('1')
         time.sleep(3)
     finally:

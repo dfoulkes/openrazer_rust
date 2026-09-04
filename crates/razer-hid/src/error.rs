@@ -38,6 +38,20 @@ pub enum HidError {
         /// What was asked for, e.g. `"poll rate"`.
         what: &'static str,
     },
+    /// The opened node is not the device that was enumerated.
+    ///
+    /// hidraw minor numbers are reused, so a device that re-enumerates between
+    /// [`crate::find_device`] and [`crate::HidrawDevice::open_expecting`] can
+    /// leave a *different* device at the same `/dev/hidrawN`. Raised by the
+    /// post-open `HIDIOCGRAWINFO` check, before any report is sent.
+    DeviceIdentityMismatch {
+        /// The node that was opened.
+        path: std::path::PathBuf,
+        /// The `(vid, pid)` enumeration promised.
+        expected: (u16, u16),
+        /// The `(vid, pid)` the kernel reports for the fd actually held.
+        got: (u16, u16),
+    },
     /// An `open`, `read` or `ioctl` failed, carrying the raw errno.
     Io {
         /// The operation that failed, e.g. `"HIDIOCSFEATURE"`.
@@ -88,6 +102,20 @@ impl core::fmt::Display for HidError {
             Self::Unsupported { pid, what } => {
                 write!(f, "device {pid:#06x} does not support {what}")
             }
+            Self::DeviceIdentityMismatch {
+                path,
+                expected,
+                got,
+            } => write!(
+                f,
+                "{} is {:04x}:{:04x}, not the {:04x}:{:04x} that was enumerated \
+                 (the device re-enumerated and the node number was reused)",
+                path.display(),
+                got.0,
+                got.1,
+                expected.0,
+                expected.1
+            ),
             Self::Io { op, errno } => write!(f, "{op} failed: errno {errno}"),
             Self::ShortRead { got } => write!(
                 f,
@@ -128,6 +156,11 @@ mod tests {
             HidError::Unsupported {
                 pid: 0x028D,
                 what: "poll rate",
+            },
+            HidError::DeviceIdentityMismatch {
+                path: "/dev/hidraw3".into(),
+                expected: (0x1532, 0x028D),
+                got: (0x046D, 0xC52B),
             },
             HidError::Io {
                 op: "HIDIOCSFEATURE",
