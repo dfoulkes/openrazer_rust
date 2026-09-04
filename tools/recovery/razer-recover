@@ -1,0 +1,93 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Emergency recovery for a Razer keyboard left unusable by driver experimentation.
+#
+# The failure this exists for: you are mid-experiment, the keyboard has stopped
+# working, and you therefore cannot type a sudo password to fix it. This script
+# is startable without a password via polkit (see 49-razer-recover.rules), so it
+# can be triggered over SSH, from a remote-control session, or by a phone.
+#
+# It is deliberately blunt, idempotent, and safe to run when nothing is wrong.
+# Every step is best-effort: a failure in one does not stop the others, because
+# a partial recovery beats none.
+
+set -uo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+RAZER_VID=1532
+log() { echo "[razer-recover] $*"; }
+
+log "starting recovery at $(date -Is)"
+
+# 1. Stop the userspace daemons so nothing re-pokes the device mid-recovery.
+#    openrazer-daemon is a USER unit, so reach it through each logged-in user.
+for uid in $(loginctl list-users --no-legend | awk '{print $1}'); do
+    systemctl --machine="$uid"@.host --user stop openrazer-daemon.service 2>/dev/null \
+        && log "stopped openrazer-daemon for uid $uid"
+    systemctl --machine="$uid"@.host --user stop razerd.service 2>/dev/null
+done
+pkill -f openrazer-daemon 2>/dev/null && log "killed stray openrazer-daemon"
+pkill -f 'razerd$' 2>/dev/null
+
+# 2. If an out-of-tree test module is loaded, drop it and restore the packaged one.
+#    Note rmmod, not modprobe -r: a modprobe.d 'install ... /bin/true' directive
+#    makes modprobe -r silently no-op, which has cost hours before now.
+if lsmod | grep -q '^razerkbd'; then
+    loaded=$(modinfo -n razerkbd 2>/dev/null)
+    log "razerkbd loaded from ${loaded:-unknown}"
+    if rmmod razerkbd 2>/dev/null; then
+        log "unloaded razerkbd"
+    else
+        log "could not unload razerkbd (in use?) — continuing"
+    fi
+fi
+
+# 3. Make sure EVERY Razer HID interface is bound to something. An interface
+#    bound to no driver is a dead keyboard, and is exactly what happens when a
+#    blacklist defeats openrazer's udev helper part-way through.
+sleep 0.5
+rebound=0
+for dev in /sys/bus/hid/devices/*:${RAZER_VID}:*; do
+    [ -e "$dev" ] || continue
+    id=$(basename "$dev")
+    if [ ! -e "$dev/driver" ]; then
+        log "ORPHANED: $id is bound to no driver — binding to hid-generic"
+        echo -n "$id" > /sys/bus/hid/drivers/hid-generic/bind 2>/dev/null \
+            && { log "  bound $id to hid-generic"; rebound=$((rebound+1)); } \
+            || log "  FAILED to bind $id"
+    fi
+done
+[ "$rebound" -eq 0 ] && log "no orphaned interfaces found"
+
+# 4. Report the resulting state so the operator can see whether it worked.
+log "--- final binding state ---"
+for dev in /sys/bus/hid/devices/*:${RAZER_VID}:*; do
+    [ -e "$dev" ] || continue
+    id=$(basename "$dev")
+    drv=$(basename "$(readlink -f "$dev/driver" 2>/dev/null)" 2>/dev/null)
+    log "  $id -> ${drv:-NONE}"
+done
+
+# NOTE: several Razer devices expose an "event-kbd" node — the Basilisk mouse
+# does, for its macro keys. So a non-zero count proves nothing about the actual
+# keyboard. List them all and let the operator judge rather than claiming
+# success from a weak signal.
+log "--- Razer input nodes present ---"
+found=0
+for n in /dev/input/by-id/*[Rr]azer*event*; do
+    [ -e "$n" ] || continue
+    log "  $(basename "$n")"
+    found=$((found+1))
+done
+if [ "$found" -eq 0 ]; then
+    log "WARNING: NO Razer input nodes at all. The device is not enumerated."
+    log "         Try a physical replug; if that fails, power-cycle the device."
+else
+    log "$found Razer input node(s) above — check YOUR keyboard is in that list."
+    log "If it is not, the interfaces may be bound but the device is not"
+    log "enumerated: replug it."
+fi
+
+log "recovery finished"
+exit 0

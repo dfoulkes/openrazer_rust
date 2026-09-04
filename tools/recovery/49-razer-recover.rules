@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Lets a named non-root user start ONLY razer-recover.service, with no sudo
+// and no password. Modelled on the polkit pattern in dfoulkes/firewall, which
+// is preferred over a /etc/sudoers.d entry: it authorises one user, one verb,
+// one unit, and nothing else.
+//
+// WHY THIS EXISTS: the failure mode being recovered from is "the keyboard does
+// not work". If recovery required a sudo password there would be no way to type
+// it. This makes recovery reachable over SSH, or from a phone via a remote
+// session, with no keyboard on the affected machine at all.
+//
+// Install:
+//   sudo install -m 0644 49-razer-recover.rules /etc/polkit-1/rules.d/
+//   (no daemon-reload needed; polkitd picks rules up automatically)
+//
+// CHANGE "dan" BELOW to your own username before installing.
+
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "razer-recover.service" &&
+        action.lookup("verb") == "start" &&
+        subject.user == "dan") {
+        return polkit.Result.YES;
+    }
+});

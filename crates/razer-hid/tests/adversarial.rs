@@ -350,7 +350,11 @@ fn every_command_family_matches_a_hand_built_golden_buffer() {
             pid: BLACKWIDOW_V4_PRO,
             // razerchromacommon.c:505-509 spells the payload 010501000001ff0000.
             label: "extended matrix static effect (0x0F/0x02, ds 9)",
-            request: cmd::set_static_effect(Storage::VarStore, LedId::Backlight, Rgb::new(0xFF, 0, 0)),
+            request: cmd::set_static_effect(
+                Storage::VarStore,
+                LedId::Backlight,
+                Rgb::new(0xFF, 0, 0),
+            ),
             want: golden(
                 0x1F,
                 0x09,
@@ -440,7 +444,11 @@ fn get_poll_rate_uses_the_right_command_id_for_each_family() {
             "{pid:#06x} must use the legacy get_polling_rate (0x85), not 0xC0"
         );
         assert_eq!(transport.sent[0][6], 0x01, "data_size");
-        assert_eq!(rate, PollRate::Hz125, "legacy reads arguments[0]: 0x08 = 125 Hz");
+        assert_eq!(
+            rate,
+            PollRate::Hz125,
+            "legacy reads arguments[0]: 0x08 = 125 Hz"
+        );
     }
 }
 
@@ -578,7 +586,8 @@ fn a_mismatched_remaining_packets_is_rejected_and_retried() {
     let mut clock = MockClock::new();
     let err = {
         let mut s = Session::new(entry(BLACKWIDOW_V4_PRO), &mut transport, &mut clock);
-        s.transact(&request).expect_err("remaining_packets mismatch")
+        s.transact(&request)
+            .expect_err("remaining_packets mismatch")
     };
     assert!(matches!(err, HidError::RetriesExhausted { .. }), "{err:?}");
     assert_eq!(transport.sent().len(), MAX_ATTEMPTS);
@@ -772,7 +781,10 @@ fn selection_keys_on_the_interface_number_not_the_interface_protocol() {
     // protocol-0x02 node is sitting right there.
     let err = find_device(&sysfs, RAZER, BLACKWIDOW_V4_PRO, 2)
         .expect_err("there is no interface 2 in this fixture");
-    assert!(matches!(err, HidError::DeviceNotFound { interface: 2, .. }), "{err:?}");
+    assert!(
+        matches!(err, HidError::DeviceNotFound { interface: 2, .. }),
+        "{err:?}"
+    );
 }
 
 /// A `/sys` that cannot be listed must fail loudly, not report "device not
@@ -875,7 +887,10 @@ fn capabilities_are_checked_per_flag_not_as_a_yes_no() {
         assert!(
             matches!(
                 s.set_device_mode(DeviceMode::Driver),
-                Err(HidError::Unsupported { what: "device mode", .. })
+                Err(HidError::Unsupported {
+                    what: "device mode",
+                    ..
+                })
             ),
             "DEVICE_MODE is not set on this entry"
         );

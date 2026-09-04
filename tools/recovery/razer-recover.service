@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Oneshot recovery unit for a Razer keyboard left unusable by driver work.
+# Started on demand — never enabled, never wanted by any target.
+#
+# Install:
+#   sudo install -m 0755 razer-recover /usr/local/sbin/razer-recover
+#   sudo install -m 0644 razer-recover.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#
+# Trigger (no password needed once the polkit rule is installed):
+#   systemctl start razer-recover.service
+#   journalctl -u razer-recover.service -n 40
+
+[Unit]
+Description=Recover a Razer keyboard left unbound or wedged by driver experimentation
+Documentation=https://github.com/dfoulkes/openrazer_rust
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/razer-recover
+RemainAfterExit=no
+TimeoutStartSec=60
+StandardOutput=journal
+StandardError=journal

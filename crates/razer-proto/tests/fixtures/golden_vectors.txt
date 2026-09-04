@@ -1,19 +1,31 @@
 # Golden test vectors for openrazer_rust / razer-proto
-# Generated from the reference implementation validated against real hardware
-# on 2026-09-04 (Razer BlackWidow V4 Pro 1532:028d, firmware v1.4, /dev/hidraw3).
-# The razer-proto crate MUST reproduce these byte-for-byte.
+#
+# PROVENANCE — read this before trusting a byte of it.
+# These frames are DERIVED BY HAND from the OpenRazer C source
+# (/home/dan/source/openrazer/driver/), not captured from a device. NOTHING in
+# this repository has ever been run against real hardware; the whole project is
+# built and tested against in-memory fixtures precisely because the target is
+# Dan's only keyboard. Every value below is therefore *specification-derived and
+# hardware-UNVERIFIED*. They are REQUEST frames the host would send, not
+# responses a device returned.
+#
+# These are the packets the Phase 3 experiment (docs/phase3-experiment.md) puts
+# on the wire by hand, so a wrong byte here is a wrong experiment. They are
+# enforced byte-for-byte by tests/golden_vectors.rs, which rebuilds each one
+# from the razer-proto constructors.
 # Layout: [0]status [1]transaction_id [2:4]remaining_packets BE [4]protocol_type
 #         [5]data_size [6]command_class [7]command_id [8:88]arguments [88]crc [89]reserved
 # CRC = XOR of bytes 2..87 inclusive (razercommon.c:111-124)
 
 ## firmware_version_v4pro
-# HARDWARE VALIDATED 2026-09-04: returned v1.4, status 0x02 SUCCESSFUL
+# Request for the firmware version (razerchromacommon.c get_firmware_version).
 # tid=0x1F class=0x00 id=0x81 data_size=0x02 args=(none)
 # crc=0x83
 001f00000002008100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008300
 
 ## serial_v4pro
-# HARDWARE VALIDATED 2026-09-04: returned TESTSERIAL00001, status 0x02 SUCCESSFUL
+# Request for the serial number (razerchromacommon.c get_serial); the 22-byte
+# answer arrives in the response, which this file does not model.
 # tid=0x1F class=0x00 id=0x82 data_size=0x16 args=(none)
 # crc=0x94
 001f00000016008200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000009400
