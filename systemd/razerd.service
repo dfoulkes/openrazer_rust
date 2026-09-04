@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# systemd USER unit for razerd. Not installed or enabled by anything in this
+# repo. To use it by hand:
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/razerd.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now razerd.service
+
+[Unit]
+Description=Razer userspace HID driver daemon
+Documentation=https://github.com/dfoulkes/openrazer_rust
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/razerd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

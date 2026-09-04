@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/razer-proto",
+    "crates/razer-devices",
+    "crates/razer-hid",
+    "crates/razerd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+rust-version = "1.94"
+repository = "https://github.com/dfoulkes/openrazer_rust"

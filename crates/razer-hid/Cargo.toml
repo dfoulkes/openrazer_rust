@@ -1,0 +1,11 @@
+[package]
+name = "razer-hid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+razer-proto = { path = "../razer-proto" }
+razer-devices = { path = "../razer-devices" }
+libc = "0.2"

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Grants access to the /dev/hidraw* nodes of Razer devices (USB vendor 0x1532),
+# which is what this userspace driver talks to directly.
+#
+# Upstream OpenRazer's own udev rules set permissions on the usb/input/hid
+# subsystems for the devices its kernel module manages, but they do NOT grant
+# access to /dev/hidraw* itself. Without a rule like this one the hidraw nodes
+# are root:root mode 0600 and razerd cannot open them as a normal user.
+#
+# Install:
+#   sudo cp udev/99-razer-rust.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# NOTE ON SAFETY: this rule only sets permissions. It contains no RUN+=, does
+# not bind or unbind drivers, and cannot affect whether your keyboard types.
+# (Upstream OpenRazer's rule does run a helper that rebinds drivers, which is a
+# different and riskier proposition.)
+
+# Preferred: hand access to whoever is logged in at the local seat, via
+# systemd-logind ACLs. Needs no group to exist and no user to be added to one,
+# so it works out of the box on any systemd distro.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", TAG+="uaccess"
+
+# Fallback for headless, multi-seat, or non-systemd setups, where `uaccess`
+# does not apply. Create a group, add yourself to it, then uncomment:
+#
+#   sudo groupadd -f razer && sudo usermod -aG razer "$USER"
+#
+# Adjust the group name if you already use another one (OpenRazer users, for
+# example, may prefer GROUP="openrazer").
+#
+#SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", GROUP="razer", MODE="0660"
