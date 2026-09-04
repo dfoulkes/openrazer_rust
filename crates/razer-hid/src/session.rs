@@ -68,6 +68,7 @@ pub struct Session<'a> {
     transport: &'a mut dyn FeatureTransport,
     clock: &'a mut dyn Clock,
     transaction_id: u8,
+    last_attempts: u32,
 }
 
 impl<'a> Session<'a> {
@@ -85,7 +86,19 @@ impl<'a> Session<'a> {
             transport,
             clock,
             transaction_id: entry.transaction_id,
+            last_attempts: 0,
         }
+    }
+
+    /// Attempts consumed by the most recent [`transact`](Session::transact).
+    ///
+    /// `1` means it succeeded first time. Anything higher means the device
+    /// rejected a well-formed report and the C driver's retry policy kicked in
+    /// — which is the closest thing a HID device has to a saturation signal, so
+    /// `razerd` exports it.
+    #[must_use]
+    pub fn last_attempts(&self) -> u32 {
+        self.last_attempts
     }
 
     /// Override the transaction id for this session.
@@ -185,6 +198,7 @@ impl<'a> Session<'a> {
             if attempt > 0 {
                 self.clock.sleep(RETRY_DELAY);
             }
+            self.last_attempts = u32::try_from(attempt).unwrap_or(u32::MAX).saturating_add(1);
             let response = self.transact_raw(request)?;
             match parse::check_response(request, &response) {
                 Ok(()) => return Ok(response),

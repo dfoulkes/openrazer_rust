@@ -11,6 +11,9 @@
 //! confirmation, because on a BlackWidow V4 Pro a bad write can drop the
 //! keyboard off the USB bus.
 
+#[allow(dead_code)] // wired up in the observability phase; tests exercise it now
+mod metrics;
+
 use std::process::ExitCode;
 
 use razer_devices::{DeviceEntry, lookup};
