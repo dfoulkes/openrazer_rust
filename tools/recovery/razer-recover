@@ -27,10 +27,17 @@ for uid in $(loginctl list-users --no-legend | awk '{print $1}'); do
         && log "stopped openrazer-daemon for uid $uid"
     systemctl --machine="$uid"@.host --user stop razerd.service 2>/dev/null
 done
-pkill -f openrazer-daemon 2>/dev/null && log "killed stray openrazer-daemon"
-pkill -f 'razerd$' 2>/dev/null
+# -x, not -f: this runs as root across every user, and `pkill -f` matches the
+# whole command line — an editor with that filename open, or a tail on its log,
+# would be killed too. Match the process name exactly.
+pkill -x openrazer-daemon 2>/dev/null && log "killed stray openrazer-daemon"
+pkill -x razerd 2>/dev/null
 
-# 2. If an out-of-tree test module is loaded, drop it and restore the packaged one.
+# 2. If razerkbd is loaded, unload it so it stops driving the device. NOTE: this
+#    does NOT reload it. Recovery deliberately ends with the interfaces bound to
+#    hid-generic (step 3), because hid-generic makes the keyboard type, which is
+#    the whole objective; reloading the module that may have wedged it would
+#    undo that. `modprobe razerkbd` by hand, or reboot, to get it back.
 #    Note rmmod, not modprobe -r: a modprobe.d 'install ... /bin/true' directive
 #    makes modprobe -r silently no-op, which has cost hours before now.
 if lsmod | grep -q '^razerkbd'; then

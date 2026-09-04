@@ -92,6 +92,10 @@ If both values match, your transport works and the wire format is confirmed on y
 hardware. If they do not, **stop** — something differs on your setup and the device table
 below likely needs an entry for it.
 
+The cross-check needs `razerkbd` loaded to have something to compare against. You do not
+need it — see below — so if it is absent the harness reports the reads it got and says the
+cross-check was skipped, rather than calling a working transport unproven.
+
 ## Adding your device
 
 The supported table is deliberately small because every entry should be *verified*, not
@@ -107,13 +111,17 @@ guessed. To add yours:
 3. Find the report index from `razer_get_report_params()` for your PID.
 4. Add the entry to `crates/razer-devices/src/table.rs`, citing the file and line each
    value came from — every existing entry does, and PRs that do not will be asked to.
-5. Confirm with `tools/validate_hidraw.py`, then open a PR saying what you tested on.
+5. Add the matching `(idProduct, bInterfaceNumber)` pair to `udev/60-razer-rust.rules`.
+   The rules are deliberately per-device and per-interface — see the install section for
+   why widening them to the whole vendor id is a bad idea.
+6. Confirm with `tools/validate_hidraw.py`, then open a PR saying what you tested on.
 
 ## Installing
 
-1. **udev rule** — grants access to Razer `hidraw` nodes. Upstream OpenRazer's rule sets
-   permissions on the usb/input/hid subsystems but not on `/dev/hidraw*`, so without this
-   the nodes are `root:root` mode `0600`.
+1. **udev rule** — grants access to the *one* `hidraw` node per supported device that this
+   driver talks to. Upstream OpenRazer's rule sets permissions on the usb/input/hid
+   subsystems but not on `/dev/hidraw*`, so without this the nodes are `root:root` mode
+   `0600`.
 
    ```sh
    sudo cp udev/60-razer-rust.rules /etc/udev/rules.d/
@@ -131,8 +139,23 @@ guessed. To add yours:
    never written, so it looks like the rule never matched. Verify with `getfacl` and look
    for a **named** entry — `user:you:rw-`. A bare `user::rw-` is the owner (root), not you.
 
-   The rule sets permissions only. It has no `RUN+=`, binds and unbinds nothing, and
+   The rules set permissions only. They have no `RUN+=`, bind and unbind nothing, and
    cannot affect whether your keyboard types.
+
+   **They are scoped to the control interface on purpose.** Reading a `/dev/hidraw*` node
+   returns the device's raw HID *input* reports, so read access to a keyboard's input
+   interface is read access to your keystrokes — every one of them, including those typed
+   into other applications, outside whatever isolation Wayland or X11 provides. That is a
+   standing grant to every process running as you, whether or not `razerd` is running, and it
+   is very likely why the kernel ships `/dev/hidraw*` root-only and why upstream OpenRazer
+   does not hand it out.
+
+   So each rule matches an exact `idProduct` *and* an exact `bInterfaceNumber` — the control
+   interface, which carries no keystrokes. The BlackWidow V4 Pro's interface 0, which is the
+   one that carries what you type, keeps its default root-only permissions. If you add a
+   device to `crates/razer-devices/src/table.rs`, add its `(idProduct, bInterfaceNumber)`
+   pair to the rule file too; do **not** widen the match back to `ATTRS{idVendor}=="1532"`
+   alone.
 
 2. **systemd user unit** — `systemd/razerd.service` is a template, not enabled by
    anything in this repo:
@@ -141,7 +164,15 @@ guessed. To add yours:
    mkdir -p ~/.config/systemd/user
    cp systemd/razerd.service ~/.config/systemd/user/
    systemctl --user daemon-reload
+   systemctl --user start razerd.service
    ```
+
+   It is a `Type=oneshot` that runs `razerd info`, because `razerd` is not a daemon yet:
+   with no subcommand the binary prints usage and exits 1, so a `Type=simple` unit with
+   `Restart=on-failure` would respawn for as long as the machine is up. It becomes a
+   long-running unit when there is something to run. The unit ships with the usual
+   hardening set; note that it sets `PrivateNetwork=yes`, which you must relax if you
+   enable the Prometheus endpoint.
 
 ## Status
 

@@ -69,6 +69,7 @@ pub struct Session<'a> {
     clock: &'a mut dyn Clock,
     transaction_id: u8,
     last_attempts: u32,
+    last_response_transaction_id: Option<u8>,
 }
 
 impl<'a> Session<'a> {
@@ -87,6 +88,7 @@ impl<'a> Session<'a> {
             clock,
             transaction_id: entry.transaction_id,
             last_attempts: 0,
+            last_response_transaction_id: None,
         }
     }
 
@@ -99,6 +101,22 @@ impl<'a> Session<'a> {
     #[must_use]
     pub fn last_attempts(&self) -> u32 {
         self.last_attempts
+    }
+
+    /// Byte 1 of the last response received by
+    /// [`transact`](Session::transact), if there has been one.
+    ///
+    /// The device echoes a transaction id back, and `check_response` ignores it
+    /// — faithfully, because the C driver ignores it too. But for *this*
+    /// project byte 1 is the entire subject, so whether the device echoes the id
+    /// it was sent is the single most interesting value in a response. Recorded
+    /// rather than enforced: a mismatch is a diagnostic signal for the Phase 3
+    /// A/B, not grounds to reject a frame real hardware sent.
+    ///
+    /// Compare against [`transaction_id`](Session::transaction_id).
+    #[must_use]
+    pub fn last_response_transaction_id(&self) -> Option<u8> {
+        self.last_response_transaction_id
     }
 
     /// Override the transaction id for this session.
@@ -132,10 +150,21 @@ impl<'a> Session<'a> {
     /// The wait is unconditional, matching `razer_send_control_msg()`
     /// (`razercommon.c:20-43`), which calls `fsleep(wait)` after every SET.
     ///
+    /// The report is validated by [`parse::check_request`] **before** the ioctl.
+    /// `RazerReport`'s fields are public, so a caller can hand this method a
+    /// `data_size` that overruns the argument array or a non-zero
+    /// `protocol_type`; on hardware where one malformed frame is the suspected
+    /// cause of a firmware reset, discovering that from the response is too
+    /// late.
+    ///
     /// # Errors
     ///
-    /// [`HidError::Io`] if the ioctl fails.
+    /// [`HidError::Proto`] if the report is malformed — returned before any
+    /// bytes leave. [`HidError::Io`] if the ioctl fails.
     pub fn send(&mut self, request: &RazerReport) -> Result<(), HidError> {
+        // Before the transaction id is even stamped: nothing malformed goes out.
+        parse::check_request(request)?;
+
         let mut report = *request;
         // The overwrite is deliberate and total: whatever the caller left in
         // byte 1, the device table wins. See the module docs.
@@ -187,6 +216,17 @@ impl<'a> Session<'a> {
     /// times because the fd returned `EACCES` helps nobody, and a transport
     /// fault is not a protocol fault.
     ///
+    /// **Note that a retry re-sends the SET.** Each attempt is a full
+    /// [`transact_raw`](Session::transact_raw), so a rejected *write* — a
+    /// `set_device_mode`, say — is re-issued up to five times, not merely
+    /// re-read. That is faithful to `razer_send_payload()`, which does the same,
+    /// and it is worth being explicit about because this project's own
+    /// hypothesis is that a device-mode write can reset this firmware: on that
+    /// hypothesis, five re-sends of a report the device just rejected amplify
+    /// exactly the event under study. Kept faithful rather than clever, because
+    /// diverging here would make the A/B in `docs/phase3-experiment.md` measure
+    /// something other than what upstream does.
+    ///
     /// # Errors
     ///
     /// [`HidError::RetriesExhausted`] carrying the last protocol error, or any
@@ -200,6 +240,7 @@ impl<'a> Session<'a> {
             }
             self.last_attempts = u32::try_from(attempt).unwrap_or(u32::MAX).saturating_add(1);
             let response = self.transact_raw(request)?;
+            self.last_response_transaction_id = Some(response.transaction_id);
             match parse::check_response(request, &response) {
                 Ok(()) => return Ok(response),
                 Err(e) => last = Some(e),

@@ -5,17 +5,57 @@
 #   mkdir -p ~/.config/systemd/user
 #   cp systemd/razerd.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
-#   systemctl --user enable --now razerd.service
+#   systemctl --user start razerd.service
+#
+# THIS IS A ONESHOT, NOT A DAEMON — because razerd is not a daemon yet.
+# `razerd` with no subcommand prints usage and exits 1, so the obvious
+# `Type=simple` + `ExecStart=.../razerd` + `Restart=on-failure` shape respawns
+# forever: at RestartSec=5 the restarts land under systemd's default limit of
+# five starts per ten seconds, so the rate limiter never trips and nothing ever
+# stops it. This unit therefore runs the read-only `info` subcommand once.
+#
+# When a real daemon mode lands, this becomes Type=simple with Restart=on-failure
+# and the StartLimit* pair below to bound a crash loop.
 
 [Unit]
-Description=Razer userspace HID driver daemon
+Description=Razer userspace HID driver — read-only device interrogation
 Documentation=https://github.com/dfoulkes/openrazer_rust
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
-Type=simple
-ExecStart=%h/.cargo/bin/razerd
-Restart=on-failure
-RestartSec=5
+Type=oneshot
+ExecStart=%h/.cargo/bin/razerd info
+RemainAfterExit=no
+
+# Hardening. razerd reads /sys, opens one /dev/hidraw* node, and does nothing
+# else; it needs none of the rest of the machine.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX
+# hidraw nodes only; everything else under /dev stays invisible.
+PrivateDevices=yes
+DeviceAllow=char-hidraw rw
+
+# NOTE: PrivateNetwork=yes and RestrictAddressFamilies=AF_UNIX must both be
+# relaxed if you enable the Prometheus endpoint (crates/razerd/src/metrics.rs).
+# Add AF_INET and drop PrivateNetwork then — and keep the listener on loopback.
 
 [Install]
 WantedBy=default.target

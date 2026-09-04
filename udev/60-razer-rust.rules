@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Grants access to the /dev/hidraw* nodes of Razer devices (USB vendor 0x1532),
-# which is what this userspace driver talks to directly.
+# Grants access to the ONE /dev/hidraw* node per supported Razer device that this
+# userspace driver actually talks to — the USB control interface.
 #
 # Upstream OpenRazer's own udev rules set permissions on the usb/input/hid
 # subsystems for the devices its kernel module manages, but they do NOT grant
@@ -28,7 +28,36 @@
 #     user:yourname:rw-      <- correct
 #     user::rw-              <- this is the OWNER (root), not you
 #
-# NOTE ON SAFETY: this rule only sets permissions. It contains no RUN+=, does
+# ---------------------------------------------------------------------------
+# WHY THESE RULES ARE NARROW, AND WHY THAT MATTERS
+# ---------------------------------------------------------------------------
+#
+# Reading a /dev/hidraw* node returns the device's raw HID *input* reports. On a
+# keyboard's input interface that means keystrokes — every one of them, including
+# those typed into other applications, outside whatever isolation Wayland or X11
+# provides. Granting a login session read access to a keyboard's hidraw node is
+# therefore equivalent to granting it a keylogger, and it is a standing grant:
+# it applies whether or not razerd is running.
+#
+# That is very likely why the kernel ships /dev/hidraw* as root-only, and why
+# upstream OpenRazer does not hand it out. So these rules match on the exact
+# product AND the exact USB interface number this driver needs — the control
+# interface, which carries no keystrokes:
+#
+#   BlackWidow V4 Pro  0x028d  interface 03   (razer-devices: report_index 0x03)
+#   Basilisk V3 Pro    0x00aa  interface 00   (razer-devices: report_index 0x00)
+#   Basilisk V3 Pro    0x00ab  interface 00   (wireless)
+#
+# Every other hidraw node on the device — including the keyboard's interface 0,
+# which is the one that carries what you type — keeps its default root-only
+# permissions.
+#
+# If you add a device to crates/razer-devices/src/table.rs, add its (idProduct,
+# bInterfaceNumber) pair here too. Do NOT broaden these to
+# `ATTRS{idVendor}=="1532"` alone: that matches every interface on every Razer
+# device, keystroke-carrying ones included.
+#
+# NOTE ON SAFETY: these rules only set permissions. They contain no RUN+=, do
 # not bind or unbind drivers, and cannot affect whether your keyboard types.
 # (Upstream OpenRazer's rule does run a helper that rebinds drivers, which is a
 # different and riskier proposition.)
@@ -36,7 +65,9 @@
 # Preferred: hand access to whoever is logged in at the local seat, via
 # systemd-logind ACLs. Needs no group to exist and no user to be added to one,
 # so it works out of the box on any systemd distro.
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="028d", ATTRS{bInterfaceNumber}=="03", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00aa", ATTRS{bInterfaceNumber}=="00", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00ab", ATTRS{bInterfaceNumber}=="00", TAG+="uaccess"
 
 # Fallback for headless, multi-seat, or non-systemd setups, where `uaccess`
 # does not apply. Create a group, add yourself to it, then uncomment:
@@ -44,6 +75,9 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", TAG+="uaccess"
 #   sudo groupadd -f razer && sudo usermod -aG razer "$USER"
 #
 # Adjust the group name if you already use another one (OpenRazer users, for
-# example, may prefer GROUP="openrazer").
+# example, may prefer GROUP="openrazer"). Keep the idProduct/bInterfaceNumber
+# match — a group-based rule that drops it hands the whole group a keylogger.
 #
-#SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", GROUP="razer", MODE="0660"
+#SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="028d", ATTRS{bInterfaceNumber}=="03", GROUP="razer", MODE="0660"
+#SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00aa", ATTRS{bInterfaceNumber}=="00", GROUP="razer", MODE="0660"
+#SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00ab", ATTRS{bInterfaceNumber}=="00", GROUP="razer", MODE="0660"

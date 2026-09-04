@@ -43,11 +43,33 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{BufRead, BufReader, Write as _};
+use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use razer_hid::HardwareOptIn;
+
+/// Largest request line (`GET /metrics HTTP/1.1`) we will buffer.
+///
+/// Without a bound, `read_line` on a socket that never sends a newline grows a
+/// `String` until the process dies. 8 KiB is what nginx allows by default and is
+/// three orders of magnitude more than any real scrape needs.
+const MAX_REQUEST_LINE: u64 = 8 * 1024;
+
+/// Largest single header line we will buffer, and how many we will read before
+/// giving up. A Prometheus scrape sends about six.
+const MAX_HEADER_LINE: u64 = 8 * 1024;
+/// Maximum number of header lines read before the request is abandoned.
+const MAX_HEADERS: usize = 64;
+
+/// Read and write timeout for a scrape connection.
+///
+/// The accept loop is single-threaded, so a peer that connects and then says
+/// nothing would otherwise park the only handler forever and starve every
+/// subsequent scrape. This is the bound that makes serial handling safe.
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Histogram buckets in seconds. A HID feature-report round trip is
 /// sub-millisecond to a few milliseconds; the tail matters because the retry
@@ -76,8 +98,16 @@ impl DeviceLabels {
 }
 
 /// Escape a Prometheus label value.
+///
+/// The exposition format requires `\`, `"` and newline to be escaped. A bare
+/// carriage return is not required to be, but these values come from the device
+/// and from sysfs, so it gets the same treatment rather than landing raw in the
+/// output.
 fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 #[derive(Debug, Default, Clone)]
@@ -214,7 +244,10 @@ impl Metrics {
             escape(env!("CARGO_PKG_VERSION"))
         );
 
-        let _ = writeln!(o, "# HELP razer_uptime_seconds Seconds since razerd started.");
+        let _ = writeln!(
+            o,
+            "# HELP razer_uptime_seconds Seconds since razerd started."
+        );
         let _ = writeln!(o, "# TYPE razer_uptime_seconds gauge");
         let _ = writeln!(
             o,
@@ -236,10 +269,10 @@ impl Metrics {
             if let Some(t) = s.transaction_id {
                 let _ = write!(extra, ",transaction_id=\"0x{t:02X}\"");
             }
-            if self.expose_serial {
-                if let Some(sn) = &s.serial {
-                    let _ = write!(extra, ",serial=\"{}\"", escape(sn));
-                }
+            if self.expose_serial
+                && let Some(sn) = &s.serial
+            {
+                let _ = write!(extra, ",serial=\"{}\"", escape(sn));
             }
             let _ = writeln!(o, "razer_device_info{{{}{}}} 1", l.render(), extra);
         }
@@ -418,8 +451,18 @@ impl Metrics {
 /// Read `/sys` for the host-observable facts about a device: its USB device
 /// number and which kernel driver owns its HID interfaces. Costs the device
 /// nothing — no packet is sent.
+///
+/// Takes a [`HardwareOptIn`] even though it opens no device node. The
+/// workspace's contract is that *every* path which reads `/sys` is gated, so
+/// that one grep for the token's constructor answers "did this run go anywhere
+/// near the hardware?". A `/sys` reader in `razerd` that skipped the gate would
+/// make that answer wrong, which is worse than no gate at all.
 #[must_use]
-pub fn read_sysfs_state(hidraw_name: &str, pid: u16) -> (Option<u64>, Option<String>) {
+pub fn read_sysfs_state(
+    hidraw_name: &str,
+    pid: u16,
+    _opt_in: &HardwareOptIn,
+) -> (Option<u64>, Option<String>) {
     let devnum = usb_parent_dir(hidraw_name)
         .and_then(|d| fs::read_to_string(d.join("devnum")).ok())
         .and_then(|s| s.trim().parse::<u64>().ok());
@@ -436,9 +479,7 @@ pub fn read_sysfs_state(hidraw_name: &str, pid: u16) -> (Option<u64>, Option<Str
                 continue;
             }
             if let Ok(p) = fs::read_link(e.path().join("driver")) {
-                driver = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned());
+                driver = p.file_name().map(|n| n.to_string_lossy().into_owned());
                 break;
             }
         }
@@ -448,9 +489,16 @@ pub fn read_sysfs_state(hidraw_name: &str, pid: u16) -> (Option<u64>, Option<Str
 
 /// Walk up from a hidraw class entry to the USB device directory — the first
 /// ancestor that has a `devnum`.
+///
+/// Private, and reachable only through [`read_sysfs_state`], which holds the
+/// `HardwareOptIn` gate for both.
 fn usb_parent_dir(hidraw_name: &str) -> Option<PathBuf> {
-    let start = fs::canonicalize(Path::new("/sys/class/hidraw").join(hidraw_name).join("device"))
-        .ok()?;
+    let start = fs::canonicalize(
+        Path::new("/sys/class/hidraw")
+            .join(hidraw_name)
+            .join("device"),
+    )
+    .ok()?;
     let mut cur: &Path = &start;
     loop {
         if cur.join("devnum").exists() {
@@ -463,18 +511,39 @@ fn usb_parent_dir(hidraw_name: &str) -> Option<PathBuf> {
     }
 }
 
+/// The default listen address.
+///
+/// Loopback, deliberately. The exposition carries device identity — and, with
+/// `--expose-serial`, the one genuinely identifying value the hardware holds —
+/// over an endpoint with no authentication of any kind. Binding it to the
+/// network is a decision someone should have to make on purpose.
+pub const DEFAULT_ADDR: &str = "127.0.0.1:9782";
+
 /// Serve `/metrics` on `addr` until the process exits.
 ///
 /// Single-threaded and deliberately so: a scrape is a handful of microseconds
 /// of string formatting, Prometheus scrapes serially, and a thread pool would
-/// be more machinery than the job needs.
+/// be more machinery than the job needs. Serial handling is only safe because
+/// every connection carries [`IO_TIMEOUT`] and bounded reads; without those, one
+/// idle peer starves every subsequent scrape.
+///
+/// Anything other than a loopback address is logged loudly at startup, because
+/// this endpoint has no authentication. See [`DEFAULT_ADDR`].
 ///
 /// # Errors
 ///
 /// Propagates the bind error if `addr` cannot be listened on.
 pub fn serve(addr: &str, metrics: &Metrics) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    eprintln!("razerd: metrics on http://{addr}/metrics");
+    let local = listener.local_addr()?;
+    if !local.ip().is_loopback() {
+        eprintln!(
+            "razerd: WARNING: metrics listening on {local}, which is not loopback.\n\
+             razerd:          This endpoint is unauthenticated and exposes device identity\n\
+             razerd:          (and the serial, with --expose-serial) to anyone who can reach it."
+        );
+    }
+    eprintln!("razerd: metrics on http://{local}/metrics");
     for stream in listener.incoming() {
         match stream {
             Ok(s) => handle(s, metrics),
@@ -485,27 +554,47 @@ pub fn serve(addr: &str, metrics: &Metrics) -> std::io::Result<()> {
 }
 
 fn handle(mut stream: TcpStream, metrics: &Metrics) {
+    // Before anything is read: a peer that connects and says nothing must not be
+    // able to hold the only handler thread. Both directions, because a peer that
+    // stops reading mid-response would otherwise block the write too.
+    if stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
+    {
+        return;
+    }
+
     let mut path = String::new();
     {
         let mut reader = BufReader::new(match stream.try_clone() {
             Ok(s) => s,
             Err(_) => return,
         });
+        // `take` is the bound: read_line on an unbounded reader grows the String
+        // for as long as the peer sends bytes without a newline.
         let mut line = String::new();
-        if reader.read_line(&mut line).is_err() {
+        if (&mut reader)
+            .take(MAX_REQUEST_LINE)
+            .read_line(&mut line)
+            .is_err()
+        {
+            return;
+        }
+        if line.len() as u64 >= MAX_REQUEST_LINE && !line.ends_with('\n') {
+            // Oversized request line; answering it would mean guessing at a
+            // truncated method and target.
             return;
         }
         if let Some(p) = line.split_whitespace().nth(1) {
             path = p.to_string();
         }
-        // Drain the rest of the request headers.
-        loop {
+        // Drain the rest of the request headers, bounded in both count and size.
+        for _ in 0..MAX_HEADERS {
             let mut h = String::new();
-            match reader.read_line(&mut h) {
+            match (&mut reader).take(MAX_HEADER_LINE).read_line(&mut h) {
                 Ok(0) => break,
                 Ok(_) if h.trim().is_empty() => break,
                 Ok(_) => {}
-                Err(_) => break,
+                Err(_) => return,
             }
         }
     }
@@ -519,9 +608,15 @@ fn handle(mut stream: TcpStream, metrics: &Metrics) {
         "/" => (
             "200 OK",
             "text/html; charset=utf-8",
-            String::from("<html><body><h1>razerd</h1><a href=\"/metrics\">metrics</a></body></html>\n"),
+            String::from(
+                "<html><body><h1>razerd</h1><a href=\"/metrics\">metrics</a></body></html>\n",
+            ),
         ),
-        _ => ("404 Not Found", "text/plain; charset=utf-8", String::from("not found\n")),
+        _ => (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            String::from("not found\n"),
+        ),
     };
 
     let response = format!(
@@ -579,7 +674,13 @@ mod tests {
     #[test]
     fn attempts_exceed_transactions_when_retrying() {
         let m = Metrics::new(false);
-        m.record_transaction(&labels(), "firmware_version", 3, Duration::from_millis(5), None);
+        m.record_transaction(
+            &labels(),
+            "firmware_version",
+            3,
+            Duration::from_millis(5),
+            None,
+        );
         let out = m.render();
         assert!(out.contains("razer_transactions_total{device=\"Razer BlackWidow V4 Pro\",pid=\"0x028D\",command=\"firmware_version\"} 1"));
         assert!(out.contains("razer_transaction_attempts_total{device=\"Razer BlackWidow V4 Pro\",pid=\"0x028D\",command=\"firmware_version\"} 3"));
@@ -612,9 +713,13 @@ mod tests {
             },
         );
         let out = m.render();
-        assert!(out.contains("razer_device_usb_devnum{device=\"Razer BlackWidow V4 Pro\",pid=\"0x028D\"} 11"));
+        assert!(out.contains(
+            "razer_device_usb_devnum{device=\"Razer BlackWidow V4 Pro\",pid=\"0x028D\"} 11"
+        ));
         assert!(out.contains("driver=\"razerkbd\"} 1"));
-        assert!(out.contains("razer_device_mode{device=\"Razer BlackWidow V4 Pro\",pid=\"0x028D\"} 3"));
+        assert!(
+            out.contains("razer_device_mode{device=\"Razer BlackWidow V4 Pro\",pid=\"0x028D\"} 3")
+        );
     }
 
     #[test]
@@ -631,6 +736,89 @@ mod tests {
             },
         );
         assert!(m.render().contains("device=\"Weird \\\"Device\\\"\""));
+    }
+
+    #[test]
+    fn carriage_returns_are_escaped_too() {
+        // kernel_driver and firmware are device- and sysfs-sourced, so they get
+        // the same treatment as anything else that lands in a label value.
+        let m = Metrics::new(false);
+        m.set_device_state(
+            &labels(),
+            DeviceState {
+                present: true,
+                kernel_driver: Some("razerkbd\r\nnot-a-new-series".into()),
+                ..DeviceState::default()
+            },
+        );
+        let out = m.render();
+        assert!(out.contains(r"razerkbd\r\nnot-a-new-series"));
+        assert!(
+            !out.contains('\r'),
+            "a raw carriage return reached the exposition output"
+        );
+    }
+
+    /// Drive one request through `handle` on a real socket and return whatever
+    /// the server said, or `None` if it hung up without answering.
+    fn scrape(request: &[u8]) -> Option<String> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let req = request.to_vec();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).expect("connect");
+            c.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            c.write_all(&req).ok();
+            let mut out = String::new();
+            c.read_to_string(&mut out).ok();
+            out
+        });
+        let (s, _) = listener.accept().expect("accept");
+        handle(s, &Metrics::new(false));
+        let out = client.join().expect("client thread");
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    #[test]
+    fn a_well_formed_scrape_is_answered() {
+        let out = scrape(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("a normal scrape must be answered");
+        assert!(out.starts_with("HTTP/1.1 200 OK"));
+        assert!(out.contains("razer_build_info"));
+    }
+
+    #[test]
+    fn a_request_line_with_no_newline_is_bounded_not_buffered_forever() {
+        // The unbounded version of this grew a String for as long as the peer
+        // kept sending. `take(MAX_REQUEST_LINE)` is what stops it, so the read
+        // must terminate and the request must be refused rather than guessed at.
+        let flood = vec![b'A'; (MAX_REQUEST_LINE as usize) * 2];
+        assert!(
+            scrape(&flood).is_none(),
+            "an oversized request line must be refused, not answered"
+        );
+    }
+
+    #[test]
+    fn the_header_loop_is_bounded() {
+        // Ten times MAX_HEADERS, never terminated by a blank line. The loop must
+        // stop counting and answer rather than reading until the peer relents.
+        let mut req = Vec::from(&b"GET /metrics HTTP/1.1\r\n"[..]);
+        for i in 0..(MAX_HEADERS * 10) {
+            req.extend_from_slice(format!("X-Pad-{i}: x\r\n").as_bytes());
+        }
+        let out = scrape(&req).expect("a bounded header run must still be answered");
+        assert!(out.starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn the_default_address_is_loopback() {
+        let addr: std::net::SocketAddr = DEFAULT_ADDR.parse().expect("DEFAULT_ADDR parses");
+        assert!(
+            addr.ip().is_loopback(),
+            "an unauthenticated endpoint that can expose the device serial must \
+             not default to a routable address"
+        );
     }
 
     #[test]

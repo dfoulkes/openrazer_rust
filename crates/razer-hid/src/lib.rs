@@ -32,6 +32,7 @@
 //!   needs `0x1F`).
 
 #![deny(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod enumerate;
 pub mod error;
@@ -45,4 +46,6 @@ pub use crate::error::HidError;
 pub use crate::mock::{MockClock, MockSysfs, MockTransport};
 pub use crate::session::{Clock, RealClock, Session};
 pub use crate::sysfs::{RealSysfs, SysfsSource, UsbInterfaceInfo};
-pub use crate::transport::{FeatureTransport, HIDRAW_BUF_LEN, HardwareOptIn, HidrawDevice};
+pub use crate::transport::{
+    FeatureTransport, HIDRAW_BUF_LEN, HardwareOptIn, HidrawDevice, RawInfo,
+};

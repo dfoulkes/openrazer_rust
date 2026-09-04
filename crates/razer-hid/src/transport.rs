@@ -36,6 +36,36 @@ const HIDIOCSFEATURE_91: libc::c_ulong = 0xC05B_4806;
 /// `HIDIOCGFEATURE(91)` — `_IOC(_IOC_WRITE|_IOC_READ, 'H', 0x07, 91)`.
 const HIDIOCGFEATURE_91: libc::c_ulong = 0xC05B_4807;
 
+/// `HIDIOCGRAWINFO` — `_IOR('H', 0x03, struct hidraw_devinfo)`.
+///
+/// `(2 << 30) | (8 << 16) | (0x48 << 8) | 0x03`. Reads kernel-cached descriptor
+/// data; **no packet reaches the device**.
+const HIDIOCGRAWINFO: libc::c_ulong = 0x8008_4803;
+
+/// `struct hidraw_devinfo` (`uapi/linux/hidraw.h`).
+///
+/// `vendor` and `product` are signed in the kernel header — a `u16` id above
+/// `0x7FFF` arrives negative — so they are read as `i16` and cast, never
+/// interpreted as signed.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct HidrawDevinfo {
+    bustype: u32,
+    vendor: i16,
+    product: i16,
+}
+
+/// What `HIDIOCGRAWINFO` says a node is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawInfo {
+    /// `BUS_USB` is `0x03`.
+    pub bustype: u32,
+    /// USB vendor id, as unsigned.
+    pub vendor_id: u16,
+    /// USB product id, as unsigned.
+    pub product_id: u16,
+}
+
 /// Proof that the caller has explicitly asked to touch real hardware.
 ///
 /// This type is the safety interlock for the whole workspace. It holds a
@@ -141,6 +171,77 @@ impl HidrawDevice {
         })
     }
 
+    /// Open a hidraw node and confirm it is the device you meant.
+    ///
+    /// **Prefer this to [`open`](HidrawDevice::open) on any path that will send
+    /// a report.** Enumeration resolves a name through sysfs; this opens that
+    /// name later, and `/dev/hidrawN` minor numbers are *reused*. If the device
+    /// re-enumerates in between — which this project deliberately provokes, and
+    /// which `tools/usb_replug.py` exists to trigger — the same node number can
+    /// belong to an entirely different device, and Razer feature reports would
+    /// then be written into whatever landed there.
+    ///
+    /// `HIDIOCGRAWINFO` closes that window: it reads kernel-cached descriptor
+    /// data for the fd we actually hold, so it answers "what did I just open?"
+    /// rather than "what was at this path a moment ago". It sends nothing to the
+    /// device — it is exactly rung 0 of `tools/validate_hidraw.py`.
+    ///
+    /// # Errors
+    ///
+    /// [`HidError::Io`] if the open or the ioctl fails;
+    /// [`HidError::DeviceIdentityMismatch`] if the node is not `vid:pid`.
+    pub fn open_expecting(
+        path: &Path,
+        vid: u16,
+        pid: u16,
+        opt_in: &HardwareOptIn,
+    ) -> Result<Self, HidError> {
+        let dev = Self::open(path, opt_in)?;
+        let info = dev.raw_info()?;
+        if info.vendor_id != vid || info.product_id != pid {
+            return Err(HidError::DeviceIdentityMismatch {
+                path: dev.path.clone(),
+                expected: (vid, pid),
+                got: (info.vendor_id, info.product_id),
+            });
+        }
+        Ok(dev)
+    }
+
+    /// Ask the kernel what this fd is, via `HIDIOCGRAWINFO`.
+    ///
+    /// Reads cached descriptor data only; no packet reaches the device.
+    ///
+    /// # Errors
+    ///
+    /// [`HidError::Io`] with `op = "HIDIOCGRAWINFO"` if the ioctl fails.
+    pub fn raw_info(&self) -> Result<RawInfo, HidError> {
+        let mut info = HidrawDevinfo::default();
+        // HIDIOCGRAWINFO writes exactly one `struct hidraw_devinfo` into the
+        // pointed-at buffer; `info` is a local `#[repr(C)]` value of that type,
+        // uniquely borrowed, and `self.file` owns a live fd for the call.
+        // SAFETY: valid, uniquely-borrowed, correctly-typed pointer; live fd.
+        let rc = unsafe {
+            libc::ioctl(
+                self.file.as_raw_fd(),
+                HIDIOCGRAWINFO,
+                std::ptr::from_mut(&mut info).cast::<libc::c_void>(),
+            )
+        };
+        if rc < 0 {
+            return Err(HidError::Io {
+                op: "HIDIOCGRAWINFO",
+                errno: last_errno(),
+            });
+        }
+        Ok(RawInfo {
+            bustype: info.bustype,
+            // The kernel's fields are __s16; ids above 0x7FFF arrive negative.
+            vendor_id: info.vendor as u16,
+            product_id: info.product as u16,
+        })
+    }
+
     /// The node this device was opened from.
     pub fn path(&self) -> &Path {
         &self.path
@@ -226,6 +327,38 @@ mod tests {
     /// with `dir = _IOC_WRITE | _IOC_READ = 3`, `type = 'H' = 0x48`.
     fn ioc(nr: u32, size: u32) -> libc::c_ulong {
         libc::c_ulong::from((3u32 << 30) | (size << 16) | (0x48u32 << 8) | nr)
+    }
+
+    /// `_IOR(type, nr, size)` — direction `_IOC_READ = 2`, for HIDIOCGRAWINFO.
+    fn ior(nr: u32, size: u32) -> libc::c_ulong {
+        libc::c_ulong::from((2u32 << 30) | (size << 16) | (0x48u32 << 8) | nr)
+    }
+
+    #[test]
+    fn rawinfo_request_number_and_struct_layout_match_the_kernel() {
+        // struct hidraw_devinfo { __u32 bustype; __s16 vendor; __s16 product; }
+        assert_eq!(core::mem::size_of::<HidrawDevinfo>(), 8);
+        assert_eq!(core::mem::align_of::<HidrawDevinfo>(), 4);
+        assert_eq!(HIDIOCGRAWINFO, ior(0x03, 8));
+        assert_eq!(HIDIOCGRAWINFO, 0x8008_4803);
+    }
+
+    #[test]
+    fn product_ids_above_0x7fff_survive_the_kernels_signed_fields() {
+        // The kernel declares vendor/product as __s16, so 0xC52B arrives as a
+        // negative i16. Reading them as signed would make a legitimate device
+        // fail the identity check in `open_expecting`.
+        let info = HidrawDevinfo {
+            bustype: 0x03,
+            vendor: 0x1532,
+            product: 0xC52Bu16 as i16,
+        };
+        assert!(
+            info.product < 0,
+            "the test premise: this is negative as i16"
+        );
+        assert_eq!(info.product as u16, 0xC52B);
+        assert_eq!(info.vendor as u16, 0x1532);
     }
 
     #[test]

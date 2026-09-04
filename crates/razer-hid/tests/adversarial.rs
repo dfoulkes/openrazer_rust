@@ -999,3 +999,108 @@ fn mock_sysfs_paths_are_never_opened() {
         assert_eq!(n.path, std::path::PathBuf::from("/dev").join(&n.name));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Outbound validation: nothing malformed reaches the transport
+// ---------------------------------------------------------------------------
+
+/// `RazerReport`'s fields are public, so "the constructors are correct" is not
+/// the same claim as "nothing malformed can be sent". This is the regression
+/// guard for the second: each of these frames used to reach `set_feature`
+/// checksum-valid and unremarked, because the only check that knew better ran
+/// on the response.
+#[test]
+fn a_malformed_report_is_refused_before_the_ioctl() {
+    /// One way to corrupt an otherwise well-formed report.
+    type Corruption = (&'static str, fn(&mut RazerReport));
+
+    let cases: [Corruption; 3] = [
+        // data_size past the end of the 80-byte argument array; razercommon.c
+        // :93-99 returns -EINVAL for exactly this.
+        ("data_size 0xFF", |r| r.data_size = 0xFF),
+        // razercommon.h:128 — protocol_type is always 0.
+        ("protocol_type 0x42", |r| r.protocol_type = 0x42),
+        // razercommon.h:134 — reserved is always 0.
+        ("reserved 0x99", |r| r.reserved = 0x99),
+    ];
+
+    for (label, corrupt) in cases {
+        let mut transport = MockTransport::new();
+        let mut clock = MockClock::new();
+        let mut bad = cmd::set_device_mode(DeviceMode::Driver);
+        corrupt(&mut bad);
+
+        let err = {
+            let mut s = Session::new(entry(BLACKWIDOW_V4_PRO), &mut transport, &mut clock);
+            s.send(&bad).expect_err(label)
+        };
+        assert!(
+            matches!(err, HidError::Proto(_)),
+            "{label}: expected a protocol error, got {err:?}"
+        );
+        assert!(
+            transport.sent().is_empty(),
+            "{label}: a malformed frame reached the transport"
+        );
+        assert!(
+            clock.sleeps().is_empty(),
+            "{label}: the guard fired after the post-write wait, not before it"
+        );
+    }
+}
+
+/// The guard must not cost anything a real command needs: every constructor,
+/// on every device in the table, still goes out.
+#[test]
+fn the_outbound_guard_passes_every_real_command() {
+    for entry in razer_devices::all() {
+        let mut transport = MockTransport::new();
+        let mut clock = MockClock::new();
+        {
+            let mut s = Session::new(entry, &mut transport, &mut clock);
+            for r in [
+                cmd::set_device_mode(DeviceMode::Driver),
+                cmd::get_device_mode(),
+                cmd::get_firmware_version(),
+                cmd::get_serial(),
+                cmd::set_brightness(Storage::VarStore, LedId::Backlight, 0x80),
+                cmd::set_static_effect(Storage::VarStore, LedId::Zero, Rgb::new(1, 2, 3)),
+                cmd::set_effect_none(Storage::VarStore, LedId::Backlight),
+                cmd::set_poll_rate_v2(PollRate::Hz1000, 0x00),
+                cmd::get_poll_rate_v2(),
+                cmd::set_poll_rate_legacy(PollRate::Hz500).expect("legacy-encodable"),
+                cmd::get_poll_rate_legacy(),
+            ] {
+                s.send(&r).unwrap_or_else(|e| panic!("{}: {e}", entry.name));
+            }
+        }
+        assert_eq!(transport.sent().len(), 11, "{}", entry.name);
+        assert_all_frames_valid(transport.sent());
+    }
+}
+
+/// Byte 1 of the response is the one byte this whole project is about, and it
+/// used to be decoded and dropped. It is recorded, not enforced — a device that
+/// echoes something unexpected is a finding, not a frame to reject.
+#[test]
+fn the_devices_echoed_transaction_id_is_observable() {
+    let request = cmd::get_firmware_version();
+    let mut transport = MockTransport::new();
+    let mut reply = RazerReport::new(request.command_class, request.command_id, request.data_size)
+        .with_args(&[0x01, 0x04]);
+    reply.status = Status::Successful;
+    // A device that answers with an id it was never sent.
+    transport.push_response(&reply.with_transaction_id(0x08));
+
+    let mut clock = MockClock::new();
+    let mut s = Session::new(entry(BLACKWIDOW_V4_PRO), &mut transport, &mut clock);
+    assert_eq!(s.last_response_transaction_id(), None, "nothing sent yet");
+    assert_eq!(s.firmware_version().expect("valid response"), (0x01, 0x04));
+
+    assert_eq!(s.transaction_id(), 0x1F, "what we sent");
+    assert_eq!(
+        s.last_response_transaction_id(),
+        Some(0x08),
+        "what the device echoed back"
+    );
+}

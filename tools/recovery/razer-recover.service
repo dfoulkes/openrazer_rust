@@ -23,3 +23,19 @@ RemainAfterExit=no
 TimeoutStartSec=60
 StandardOutput=journal
 StandardError=journal
+
+# Hardening. This unit runs as root and genuinely needs to rmmod and to write to
+# /sys/bus/hid/drivers/*/bind, so most of the usual set would break it — but it
+# has no business on the network and no business gaining privileges, and a
+# passwordless polkit-triggered root unit is exactly the place to say so.
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ProtectHome=read-only
+# Deliberately NOT set: ProtectKernelModules (needs rmmod), ProtectSystem=strict
+# and ProtectKernelTunables (needs to write /sys/bus/hid/drivers/*/bind).
