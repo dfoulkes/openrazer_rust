@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The error type for enumeration and transport.
 
-use razer_proto::ProtoError;
+use razer_proto::{ProtoError, report::Status};
 
 /// Anything that can go wrong finding, opening or talking to a Razer device.
 ///
@@ -77,6 +77,106 @@ pub enum HidError {
         /// The protocol error from the final attempt.
         last: ProtoError,
     },
+}
+
+impl HidError {
+    /// The device's own terminal status byte, when there was one.
+    ///
+    /// The C driver's `razer_send_payload()` ends its retry loop with a switch
+    /// that gives each terminal status its own errno
+    /// (`razermouse_driver.c:157-175`):
+    ///
+    /// ```text
+    /// RAZER_CMD_FAILURE       -> -EINVAL
+    /// RAZER_CMD_NOT_SUPPORTED -> -ENOTSUPP
+    /// RAZER_CMD_TIMEOUT       -> -ETIMEDOUT
+    /// ```
+    ///
+    /// [`HidError::RetriesExhausted`] collapses all three into one variant, so
+    /// this restores the distinction callers need without changing the retry
+    /// policy itself — which stays faithful to upstream because
+    /// `docs/phase3-experiment.md` measures it.
+    ///
+    /// Returns `None` for transport faults, which never carry a device status.
+    #[must_use]
+    pub fn terminal_status(&self) -> Option<Status> {
+        match self {
+            Self::RetriesExhausted {
+                last: ProtoError::DeviceStatus(status),
+            }
+            | Self::Proto(ProtoError::DeviceStatus(status)) => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// True when the device answered, consistently, with `RAZER_CMD_TIMEOUT`
+    /// (`0x04`).
+    ///
+    /// This is what a Razer wireless receiver says when it is plugged in but
+    /// has no mouse behind it — the normal state whenever the mouse is on its
+    /// cable, because the dongle stays enumerated alongside the wired device.
+    /// It is a definite answer from a working dongle, not a fault: the receiver
+    /// is telling us it has nobody to relay to.
+    ///
+    /// Report it as a device *state*, not an error. Observed on a Basilisk V3
+    /// Pro on 2026-09-05 with the mouse wired: `0x00AA` read firmware v2.0
+    /// while `0x00AB`, the idle dongle, returned `0x04` to every request.
+    #[must_use]
+    pub fn is_receiver_idle(&self) -> bool {
+        self.terminal_status() == Some(Status::Timeout)
+    }
+}
+
+#[cfg(test)]
+mod terminal_status_tests {
+    use super::*;
+
+    #[test]
+    fn an_idle_receiver_is_recognised_from_a_timeout_status() {
+        let e = HidError::RetriesExhausted {
+            last: ProtoError::DeviceStatus(Status::Timeout),
+        };
+        assert_eq!(e.terminal_status(), Some(Status::Timeout));
+        assert!(e.is_receiver_idle());
+    }
+
+    #[test]
+    fn the_other_terminal_statuses_are_kept_distinct() {
+        // Upstream gives each of these its own errno; so must we.
+        for status in [Status::Failure, Status::NotSupported] {
+            let e = HidError::RetriesExhausted {
+                last: ProtoError::DeviceStatus(status),
+            };
+            assert_eq!(e.terminal_status(), Some(status));
+            assert!(
+                !e.is_receiver_idle(),
+                "{status:?} must not be mistaken for an idle receiver"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transport_fault_carries_no_device_status() {
+        // An EACCES is not the device saying anything at all.
+        let e = HidError::Io {
+            op: "HIDIOCSFEATURE",
+            errno: 13,
+        };
+        assert_eq!(e.terminal_status(), None);
+        assert!(!e.is_receiver_idle());
+    }
+
+    #[test]
+    fn a_non_status_protocol_error_is_not_an_idle_receiver() {
+        let e = HidError::RetriesExhausted {
+            last: ProtoError::BadCrc {
+                expected: 0x05,
+                got: 0x06,
+            },
+        };
+        assert_eq!(e.terminal_status(), None);
+        assert!(!e.is_receiver_idle());
+    }
 }
 
 impl From<ProtoError> for HidError {

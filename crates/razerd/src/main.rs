@@ -304,6 +304,7 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut opened = 0usize;
     let mut failed = 0usize;
+    let mut idle = 0usize;
 
     for pid in pids {
         let entry: &'static DeviceEntry = lookup(pid).expect("checked above");
@@ -341,8 +342,23 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
         let mut clock = RealClock;
         let mut session = Session::new(entry, &mut transport, &mut clock);
 
+        // Probe once before doing the full set. A wireless receiver that is
+        // plugged in with no mouse behind it — the normal state whenever the
+        // mouse is on its cable, because the dongle stays enumerated — answers
+        // RAZER_CMD_TIMEOUT to everything. That is a definite answer from a
+        // working dongle, not a fault, so report it as a state and move on.
+        // Carrying on would burn ten more retries to print the same misleading
+        // ERROR twice again, and list a working mouse as broken two entries
+        // below its own wired self.
         match session.firmware_version() {
             Ok((major, minor)) => println!("  firmware        v{major}.{minor}"),
+            Err(e) if e.is_receiver_idle() => {
+                println!("  state           no device connected (receiver idle)");
+                println!("                  dongle answered 0x04 TIMEOUT; the mouse is");
+                println!("                  elsewhere — on its cable, or powered off");
+                idle += 1;
+                continue;
+            }
             Err(e) => println!("  firmware        ERROR: {e}"),
         }
         match session.serial() {
@@ -364,9 +380,16 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\nAll commands above were GET-class reads. Nothing was written.");
+    if idle > 0 {
+        println!("{idle} receiver(s) had no device connected; that is a state, not an error.");
+    }
 
     // Exiting 0 after reaching no device at all would be a lie to any script
     // wrapping this. Report success only if at least one device was opened.
+    //
+    // An idle receiver counts as opened: the dongle is present and answering,
+    // and saying otherwise would make `razerd info` fail merely because the
+    // mouse is on its cable.
     if opened == 0 && failed > 0 {
         return Err(format!("could not open any of the {failed} supported device(s)").into());
     }
