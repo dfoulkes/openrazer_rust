@@ -282,6 +282,34 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// What `info` reports for one device, decided from its first probe.
+///
+/// Split out from [`info`] so the decision is testable: `info` itself opens
+/// real hidraw nodes and prints, so the branch that matters — telling an idle
+/// receiver apart from a broken device — could not otherwise be covered.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// The device answered with its firmware version.
+    Firmware(u8, u8),
+    /// A wireless receiver that is present but has no device behind it.
+    ///
+    /// Normal whenever the mouse is on its cable: the dongle stays enumerated
+    /// and answers `RAZER_CMD_TIMEOUT` to everything. A state, not an error.
+    ReceiverIdle,
+    /// Anything else, rendered for display.
+    Failed(String),
+}
+
+impl Probe {
+    fn classify(result: Result<(u8, u8), razer_hid::HidError>) -> Self {
+        match result {
+            Ok((major, minor)) => Self::Firmware(major, minor),
+            Err(e) if e.is_receiver_idle() => Self::ReceiverIdle,
+            Err(e) => Self::Failed(e.to_string()),
+        }
+    }
+}
+
 /// Read-only device interrogation.
 fn info() -> Result<(), Box<dyn std::error::Error>> {
     let opt_in = HardwareOptIn::i_understand_this_touches_real_hardware();
@@ -350,16 +378,16 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
         // Carrying on would burn ten more retries to print the same misleading
         // ERROR twice again, and list a working mouse as broken two entries
         // below its own wired self.
-        match session.firmware_version() {
-            Ok((major, minor)) => println!("  firmware        v{major}.{minor}"),
-            Err(e) if e.is_receiver_idle() => {
+        match Probe::classify(session.firmware_version()) {
+            Probe::Firmware(major, minor) => println!("  firmware        v{major}.{minor}"),
+            Probe::ReceiverIdle => {
                 println!("  state           no device connected (receiver idle)");
                 println!("                  dongle answered 0x04 TIMEOUT; the mouse is");
                 println!("                  elsewhere — on its cable, or powered off");
                 idle += 1;
                 continue;
             }
-            Err(e) => println!("  firmware        ERROR: {e}"),
+            Probe::Failed(msg) => println!("  firmware        ERROR: {msg}"),
         }
         match session.serial() {
             Ok(s) => println!("  serial          {s}"),
@@ -394,4 +422,53 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("could not open any of the {failed} supported device(s)").into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::Probe;
+    use razer_hid::HidError;
+    use razer_proto::{ProtoError, report::Status};
+
+    #[test]
+    fn a_firmware_read_reports_its_version() {
+        assert_eq!(Probe::classify(Ok((1, 4))), Probe::Firmware(1, 4));
+    }
+
+    /// The case this whole change exists for: the Basilisk's dongle with the
+    /// mouse on its cable must read as a state, never as a failure.
+    #[test]
+    fn a_timeout_from_an_idle_receiver_is_a_state_not_a_failure() {
+        let err = HidError::RetriesExhausted {
+            last: ProtoError::DeviceStatus(Status::Timeout),
+        };
+        assert_eq!(Probe::classify(Err(err)), Probe::ReceiverIdle);
+    }
+
+    /// Upstream gives FAILURE, NOT_SUPPORTED and TIMEOUT three different
+    /// errnos. If these collapse, an unsupported command starts being
+    /// reported to the user as an absent mouse.
+    #[test]
+    fn other_terminal_statuses_still_report_as_failures() {
+        for status in [Status::Failure, Status::NotSupported] {
+            let err = HidError::RetriesExhausted {
+                last: ProtoError::DeviceStatus(status),
+            };
+            assert!(
+                matches!(Probe::classify(Err(err)), Probe::Failed(_)),
+                "{status:?} must report as a failure"
+            );
+        }
+    }
+
+    /// A permissions problem is not an absent mouse. This is the regression
+    /// that would hide a broken udev rule behind a reassuring message.
+    #[test]
+    fn a_permission_error_is_a_failure_not_an_idle_receiver() {
+        let err = HidError::Io {
+            op: "HIDIOCSFEATURE",
+            errno: 13,
+        };
+        assert!(matches!(Probe::classify(Err(err)), Probe::Failed(_)));
+    }
 }
