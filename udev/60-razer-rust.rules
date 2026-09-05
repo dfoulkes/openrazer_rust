@@ -57,6 +57,47 @@
 # `ATTRS{idVendor}=="1532"` alone: that matches every interface on every Razer
 # device, keystroke-carrying ones included.
 #
+# ---------------------------------------------------------------------------
+# WHY vid/pid ARE MATCHED WITH ENV{} AND NOT ATTRS{}
+# ---------------------------------------------------------------------------
+#
+# This looks like it should work and does not:
+#
+#   ATTRS{idVendor}=="1532", ATTRS{idProduct}=="028d", ATTRS{bInterfaceNumber}=="03"
+#
+# udev requires every ATTRS{} in a single rule to match on the SAME parent
+# device. These three never can, because they live on two different devices:
+#
+#   /sys/bus/usb/devices/1-5.3       idVendor, idProduct      (the USB device)
+#   /sys/bus/usb/devices/1-5.3:1.3   bInterfaceNumber         (the USB interface)
+#
+# The rule therefore matches nothing at all, silently. It fails CLOSED, so the
+# symptom is not a security hole but razerd losing access, with a rule sitting
+# in /etc/udev/rules.d that looks perfectly correct. Verified on real hardware
+# 2026-09-05: CURRENT_TAGS on the control node came back ":seat:" with no
+# "uaccess" after a reload and trigger.
+#
+# ID_VENDOR_ID and ID_MODEL_ID are set as properties on the hidraw device
+# itself by the usb_id builtin, so matching them with ENV{} leaves exactly one
+# ATTRS{} per rule and the same-parent constraint cannot apply.
+#
+# Check a change here with:  udevadm info /dev/hidrawN | grep CURRENT_TAGS
+# A working rule shows ":seat:uaccess:". Do not trust the ACL alone -- see the
+# note on stale ACLs below.
+#
+# ---------------------------------------------------------------------------
+# STALE ACLs: CHANGING THIS FILE DOES NOT REVOKE ACCESS ALREADY GRANTED
+# ---------------------------------------------------------------------------
+#
+# systemd's uaccess builtin only runs while the uaccess tag is present. Remove
+# the tag and nothing runs to strip the ACL it applied earlier, so the old
+# grant survives a reload, a trigger and a settle. It clears when the device
+# node is destroyed and recreated -- a real replug, or a reboot -- or if you
+# strip it by hand with `setfacl -b /dev/hidrawN`.
+#
+# After narrowing this file, always re-check with getfacl. A tag that is gone
+# is not the same as access that is gone.
+#
 # NOTE ON SAFETY: these rules only set permissions. They contain no RUN+=, do
 # not bind or unbind drivers, and cannot affect whether your keyboard types.
 # (Upstream OpenRazer's rule does run a helper that rebinds drivers, which is a
@@ -65,9 +106,9 @@
 # Preferred: hand access to whoever is logged in at the local seat, via
 # systemd-logind ACLs. Needs no group to exist and no user to be added to one,
 # so it works out of the box on any systemd distro.
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="028d", ATTRS{bInterfaceNumber}=="03", TAG+="uaccess"
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00aa", ATTRS{bInterfaceNumber}=="00", TAG+="uaccess"
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00ab", ATTRS{bInterfaceNumber}=="00", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="1532", ENV{ID_MODEL_ID}=="028d", ATTRS{bInterfaceNumber}=="03", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="1532", ENV{ID_MODEL_ID}=="00aa", ATTRS{bInterfaceNumber}=="00", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="1532", ENV{ID_MODEL_ID}=="00ab", ATTRS{bInterfaceNumber}=="00", TAG+="uaccess"
 
 # Fallback for headless, multi-seat, or non-systemd setups, where `uaccess`
 # does not apply. Create a group, add yourself to it, then uncomment:
@@ -78,6 +119,6 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00ab", ATTRS{bI
 # example, may prefer GROUP="openrazer"). Keep the idProduct/bInterfaceNumber
 # match — a group-based rule that drops it hands the whole group a keylogger.
 #
-#SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="028d", ATTRS{bInterfaceNumber}=="03", GROUP="razer", MODE="0660"
-#SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00aa", ATTRS{bInterfaceNumber}=="00", GROUP="razer", MODE="0660"
-#SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="00ab", ATTRS{bInterfaceNumber}=="00", GROUP="razer", MODE="0660"
+#SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="1532", ENV{ID_MODEL_ID}=="028d", ATTRS{bInterfaceNumber}=="03", GROUP="razer", MODE="0660"
+#SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="1532", ENV{ID_MODEL_ID}=="00aa", ATTRS{bInterfaceNumber}=="00", GROUP="razer", MODE="0660"
+#SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="1532", ENV{ID_MODEL_ID}=="00ab", ATTRS{bInterfaceNumber}=="00", GROUP="razer", MODE="0660"
