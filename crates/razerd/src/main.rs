@@ -282,6 +282,94 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// One reading from a device.
+///
+/// Split out from [`info`] so the decisions are testable: `info` itself opens
+/// real hidraw nodes and prints, so the branch that matters — telling a device
+/// that has gone away apart from a device that is broken — could not otherwise
+/// be covered.
+#[derive(Debug, PartialEq, Eq)]
+enum Reading<T> {
+    /// The device answered.
+    Value(T),
+    /// A wireless receiver that is present but has no device behind it.
+    ///
+    /// Normal whenever the mouse is on its cable: the dongle stays enumerated
+    /// and answers `RAZER_CMD_TIMEOUT` to everything. A state, not an error.
+    ReceiverIdle,
+    /// Anything else, rendered for display.
+    Failed(String),
+}
+
+impl<T> Reading<T> {
+    fn classify(result: Result<T, razer_hid::HidError>) -> Self {
+        match result {
+            Ok(v) => Self::Value(v),
+            Err(e) if e.is_receiver_idle() => Self::ReceiverIdle,
+            Err(e) => Self::Failed(e.to_string()),
+        }
+    }
+}
+
+/// Everything `info` reads from one device, in the order it reads them.
+///
+/// `None` means "not attempted", which is different from a failure: once a
+/// device reports itself gone there is nothing left to ask it, and asking
+/// anyway costs five retries per question for an answer already known.
+#[derive(Debug)]
+struct DeviceReport {
+    firmware: Reading<(u8, u8)>,
+    serial: Option<Reading<String>>,
+    device_mode: Option<Reading<(u8, u8)>>,
+}
+
+impl DeviceReport {
+    /// True if any reading found the receiver with nothing behind it.
+    fn receiver_idle(&self) -> bool {
+        matches!(self.firmware, Reading::ReceiverIdle)
+            || matches!(self.serial, Some(Reading::ReceiverIdle))
+            || matches!(self.device_mode, Some(Reading::ReceiverIdle))
+    }
+}
+
+/// Read one device, stopping the moment it reports itself absent.
+///
+/// A device can go away between any two reads, not merely before the first:
+/// a wireless mouse can sleep, or its cable can be pulled mid-run. Every read
+/// is therefore classified, not just the opening probe — otherwise the
+/// misleading "ERROR ... status 0x04" simply moves one line down.
+///
+/// A hard failure does **not** stop the sequence. `NOT_SUPPORTED` on the serial
+/// says nothing about whether the device mode is readable, and upstream keeps
+/// those statuses distinct for exactly that reason.
+fn read_device(session: &mut razer_hid::Session<'_>) -> DeviceReport {
+    let firmware = Reading::classify(session.firmware_version());
+    if matches!(firmware, Reading::ReceiverIdle) {
+        return DeviceReport {
+            firmware,
+            serial: None,
+            device_mode: None,
+        };
+    }
+
+    let serial = Reading::classify(session.serial());
+    if matches!(serial, Reading::ReceiverIdle) {
+        return DeviceReport {
+            firmware,
+            serial: Some(serial),
+            device_mode: None,
+        };
+    }
+
+    // GET device mode — command id 0x84, a read. Does not change the device.
+    let device_mode = Reading::classify(session.get_device_mode());
+    DeviceReport {
+        firmware,
+        serial: Some(serial),
+        device_mode: Some(device_mode),
+    }
+}
+
 /// Read-only device interrogation.
 fn info() -> Result<(), Box<dyn std::error::Error>> {
     let opt_in = HardwareOptIn::i_understand_this_touches_real_hardware();
@@ -304,6 +392,7 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut opened = 0usize;
     let mut failed = 0usize;
+    let mut idle = 0usize;
 
     for pid in pids {
         let entry: &'static DeviceEntry = lookup(pid).expect("checked above");
@@ -341,17 +430,25 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
         let mut clock = RealClock;
         let mut session = Session::new(entry, &mut transport, &mut clock);
 
-        match session.firmware_version() {
-            Ok((major, minor)) => println!("  firmware        v{major}.{minor}"),
-            Err(e) => println!("  firmware        ERROR: {e}"),
+        // Every read is classified, not just the first. A device can go away
+        // between any two of them -- a wireless mouse can sleep, or its cable
+        // can be pulled mid-run -- and without this the misleading
+        // "ERROR ... status 0x04" merely moves one line down and still costs
+        // five retries to print.
+        let report = read_device(&mut session);
+
+        match report.firmware {
+            Reading::Value((major, minor)) => println!("  firmware        v{major}.{minor}"),
+            Reading::ReceiverIdle => {}
+            Reading::Failed(ref msg) => println!("  firmware        ERROR: {msg}"),
         }
-        match session.serial() {
-            Ok(s) => println!("  serial          {s}"),
-            Err(e) => println!("  serial          ERROR: {e}"),
+        match report.serial {
+            Some(Reading::Value(ref serial)) => println!("  serial          {serial}"),
+            Some(Reading::Failed(ref msg)) => println!("  serial          ERROR: {msg}"),
+            Some(Reading::ReceiverIdle) | None => {}
         }
-        // GET device mode — command id 0x84, a read. Does not change the device.
-        match session.get_device_mode() {
-            Ok((mode, param)) => {
+        match report.device_mode {
+            Some(Reading::Value((mode, param))) => {
                 let label = match mode {
                     0x00 => "normal (device)",
                     0x03 => "driver",
@@ -359,16 +456,233 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 println!("  device mode     0x{mode:02X} {label} (param 0x{param:02X})");
             }
-            Err(e) => println!("  device mode     ERROR: {e}"),
+            Some(Reading::Failed(ref msg)) => println!("  device mode     ERROR: {msg}"),
+            Some(Reading::ReceiverIdle) | None => {}
+        }
+
+        if report.receiver_idle() {
+            println!("  state           no device connected (receiver idle)");
+            println!("                  dongle answered 0x04 TIMEOUT; the mouse is");
+            println!("                  elsewhere — on its cable, or powered off");
+            idle += 1;
         }
     }
 
     println!("\nAll commands above were GET-class reads. Nothing was written.");
+    if idle > 0 {
+        println!("{idle} receiver(s) had no device connected; that is a state, not an error.");
+    }
 
     // Exiting 0 after reaching no device at all would be a lie to any script
     // wrapping this. Report success only if at least one device was opened.
+    //
+    // An idle receiver counts as opened: the dongle is present and answering,
+    // and saying otherwise would make `razerd info` fail merely because the
+    // mouse is on its cable.
     if opened == 0 && failed > 0 {
         return Err(format!("could not open any of the {failed} supported device(s)").into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod read_device_tests {
+    use super::{DeviceReport, Reading, read_device};
+    use razer_devices::lookup;
+    use razer_hid::Session;
+    use razer_hid::mock::{MockClock, MockTransport};
+    use razer_proto::cmd;
+    use razer_proto::report::{RazerReport, Status};
+
+    const BASILISK_WIRELESS: u16 = 0x00AB;
+    const MAX_ATTEMPTS: usize = 5;
+
+    /// A valid response to `request`, carrying `status`.
+    fn response(request: &RazerReport, status: Status, args: &[u8]) -> RazerReport {
+        let mut r = RazerReport::new(request.command_class, request.command_id, request.data_size)
+            .with_args(args);
+        r.status = status;
+        r.remaining_packets = request.remaining_packets;
+        r
+    }
+
+    /// Queue five identical `status` responses — one full retry loop's worth.
+    fn push_exhausted(t: &mut MockTransport, request: &RazerReport, status: Status) {
+        for _ in 0..MAX_ATTEMPTS {
+            t.push_response(&response(request, status, &[0x00, 0x00]));
+        }
+    }
+
+    fn run(transport: &mut MockTransport) -> DeviceReport {
+        let mut clock = MockClock::new();
+        let entry = lookup(BASILISK_WIRELESS).expect("in the device table");
+        let mut session = Session::new(entry, transport, &mut clock);
+        read_device(&mut session)
+    }
+
+    /// The dongle with the mouse on its cable: absent from the first question.
+    /// Nothing after it is asked, because the answer is already known and each
+    /// question costs five retries.
+    #[test]
+    fn a_device_absent_from_the_first_read_is_not_asked_again() {
+        let mut t = MockTransport::new();
+        push_exhausted(&mut t, &cmd::get_firmware_version(), Status::Timeout);
+
+        let report = run(&mut t);
+
+        assert_eq!(report.firmware, Reading::ReceiverIdle);
+        assert!(report.serial.is_none(), "serial must not be attempted");
+        assert!(
+            report.device_mode.is_none(),
+            "device mode must not be attempted"
+        );
+        assert!(report.receiver_idle());
+        assert_eq!(
+            t.sent().len(),
+            MAX_ATTEMPTS,
+            "one read's worth of retries, not three"
+        );
+    }
+
+    /// The reverse of the case that started this: the device answers, then
+    /// goes away mid-run. A wireless mouse can sleep between two GETs, or its
+    /// cable can be pulled. Without this the misleading "ERROR ... 0x04"
+    /// simply moves one line down.
+    #[test]
+    fn a_device_that_vanishes_mid_run_stops_the_sequence() {
+        let mut t = MockTransport::new();
+        let fw = cmd::get_firmware_version();
+        t.push_response(&response(&fw, Status::Successful, &[0x02, 0x00]));
+        push_exhausted(&mut t, &cmd::get_serial(), Status::Timeout);
+
+        let report = run(&mut t);
+
+        assert_eq!(report.firmware, Reading::Value((2, 0)));
+        assert_eq!(report.serial, Some(Reading::ReceiverIdle));
+        assert!(
+            report.device_mode.is_none(),
+            "device mode must not be attempted after the device reports itself gone"
+        );
+        assert!(report.receiver_idle());
+        assert_eq!(
+            t.sent().len(),
+            1 + MAX_ATTEMPTS,
+            "the firmware read plus one retry loop, not two"
+        );
+    }
+
+    /// A hard failure is not absence. NOT_SUPPORTED on the serial says nothing
+    /// about whether the device mode is readable, and upstream keeps those
+    /// statuses distinct for exactly that reason. Stopping here would hide a
+    /// readable device mode behind an unrelated failure.
+    #[test]
+    fn a_hard_failure_does_not_stop_the_sequence() {
+        let mut t = MockTransport::new();
+        let fw = cmd::get_firmware_version();
+        t.push_response(&response(&fw, Status::Successful, &[0x02, 0x00]));
+        push_exhausted(&mut t, &cmd::get_serial(), Status::NotSupported);
+        let dm = cmd::get_device_mode();
+        t.push_response(&response(&dm, Status::Successful, &[0x00, 0x00]));
+
+        let report = run(&mut t);
+
+        assert!(matches!(report.serial, Some(Reading::Failed(_))));
+        assert_eq!(
+            report.device_mode,
+            Some(Reading::Value((0, 0))),
+            "device mode must still be read after an unrelated failure"
+        );
+        assert!(
+            !report.receiver_idle(),
+            "NOT_SUPPORTED is not an absent device"
+        );
+    }
+
+    #[test]
+    fn a_fully_present_device_reports_all_three() {
+        let mut t = MockTransport::new();
+        t.push_response(&response(
+            &cmd::get_firmware_version(),
+            Status::Successful,
+            &[0x02, 0x00],
+        ));
+        t.push_response(&response(
+            &cmd::get_serial(),
+            Status::Successful,
+            b"PM0000000000000",
+        ));
+        t.push_response(&response(
+            &cmd::get_device_mode(),
+            Status::Successful,
+            &[0x00, 0x00],
+        ));
+
+        let report = run(&mut t);
+
+        assert_eq!(report.firmware, Reading::Value((2, 0)));
+        assert!(matches!(report.serial, Some(Reading::Value(_))));
+        assert_eq!(report.device_mode, Some(Reading::Value((0, 0))));
+        assert!(!report.receiver_idle());
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::Reading;
+    use razer_hid::HidError;
+    use razer_proto::{ProtoError, report::Status};
+
+    #[test]
+    fn a_value_is_carried_through() {
+        assert_eq!(
+            Reading::classify(Ok::<_, HidError>((1u8, 4u8))),
+            Reading::Value((1, 4))
+        );
+    }
+
+    /// The case this whole change exists for.
+    #[test]
+    fn a_timeout_is_a_state_not_a_failure() {
+        let err = HidError::RetriesExhausted {
+            last: ProtoError::DeviceStatus(Status::Timeout),
+        };
+        assert_eq!(
+            Reading::classify(Err::<(u8, u8), _>(err)),
+            Reading::ReceiverIdle
+        );
+    }
+
+    /// Upstream gives FAILURE, NOT_SUPPORTED and TIMEOUT three different
+    /// errnos. If they collapse, an unsupported command starts being reported
+    /// to the user as an absent mouse.
+    #[test]
+    fn other_terminal_statuses_still_report_as_failures() {
+        for status in [Status::Failure, Status::NotSupported] {
+            let err = HidError::RetriesExhausted {
+                last: ProtoError::DeviceStatus(status),
+            };
+            assert!(
+                matches!(
+                    Reading::classify(Err::<(u8, u8), _>(err)),
+                    Reading::Failed(_)
+                ),
+                "{status:?} must report as a failure"
+            );
+        }
+    }
+
+    /// An EACCES must never render as "no device connected". That is the
+    /// regression that would hide a broken udev rule behind a reassuring
+    /// message.
+    #[test]
+    fn a_permission_error_is_a_failure_not_an_absent_device() {
+        let err = HidError::Io {
+            op: "HIDIOCSFEATURE",
+            errno: 13,
+        };
+        assert!(matches!(
+            Reading::classify(Err::<(u8, u8), _>(err)),
+            Reading::Failed(_)
+        ));
+    }
 }

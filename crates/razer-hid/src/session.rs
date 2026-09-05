@@ -662,6 +662,69 @@ mod tests {
     }
 
     /// Criterion 21.
+    /// The Basilisk V3 Pro's dongle, plugged in with the mouse on its cable.
+    /// It answers RAZER_CMD_TIMEOUT to everything: a definite answer from
+    /// working hardware, not a fault. Callers must be able to tell it apart
+    /// from a real failure so they can report it as a state.
+    #[test]
+    fn a_receiver_with_no_device_behind_it_is_recognisable() {
+        let request = cmd::get_firmware_version();
+        let mut transport = MockTransport::new();
+        for _ in 0..MAX_ATTEMPTS {
+            let mut idle = ok_response(&request, &[0x00, 0x00]);
+            idle.status = Status::Timeout;
+            transport.push_response(&idle);
+        }
+        let mut clock = MockClock::new();
+
+        let err = {
+            let mut session = Session::new(entry(BASILISK_WIRELESS), &mut transport, &mut clock);
+            session
+                .firmware_version()
+                .expect_err("an idle receiver cannot report a firmware version")
+        };
+
+        assert!(
+            err.is_receiver_idle(),
+            "expected an idle receiver, got {err:?}"
+        );
+        assert_eq!(err.terminal_status(), Some(Status::Timeout));
+        // The retry policy is unchanged: upstream retries all five times on
+        // TIMEOUT before returning -ETIMEDOUT, and phase3-experiment.md
+        // measures that loop.
+        assert_eq!(transport.sent().len(), MAX_ATTEMPTS, "still five attempts");
+        assert_frames_well_formed(&transport);
+    }
+
+    /// The distinction upstream draws with three different errnos. If these
+    /// collapse together again, an unsupported command starts being reported
+    /// as an absent mouse.
+    #[test]
+    fn other_terminal_statuses_are_not_mistaken_for_an_idle_receiver() {
+        for status in [Status::Failure, Status::NotSupported] {
+            let request = cmd::get_firmware_version();
+            let mut transport = MockTransport::new();
+            for _ in 0..MAX_ATTEMPTS {
+                let mut bad = ok_response(&request, &[0x00, 0x00]);
+                bad.status = status;
+                transport.push_response(&bad);
+            }
+            let mut clock = MockClock::new();
+
+            let err = {
+                let mut session =
+                    Session::new(entry(BASILISK_WIRELESS), &mut transport, &mut clock);
+                session.firmware_version().expect_err("status is not ok")
+            };
+
+            assert_eq!(err.terminal_status(), Some(status));
+            assert!(
+                !err.is_receiver_idle(),
+                "{status:?} must not read as an idle receiver"
+            );
+        }
+    }
+
     #[test]
     fn a_permanently_mismatched_response_exhausts_five_attempts() {
         let request = cmd::get_firmware_version();
